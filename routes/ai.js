@@ -1,19 +1,36 @@
 const express = require("express");
-
 const router = express.Router();
 
 const MAX_SORU = 5;
 const MOCK_EXAM_SORU = 20;
 const TIMEOUT_MS = 110000;
-const MAX_JSON_DENEME = 2;
+const MAX_JSON_DENEME = 3;
+
+// openrouter/free her istekte farklı ücretsiz modeli seçebilir. Bazı rotalarda
+// soru yerine moderasyon çıktısı ("User Safety: safe") dönebildiği için soru
+// üretiminde kararlı bir modeli varsayılan yapıyoruz. Railway ENV ile değişebilir.
+const SORU_MODELLERI = [
+  process.env.OPENROUTER_MODEL || "qwen/qwen3-next-80b-a3b-instruct:free",
+  "nvidia/nemotron-3-ultra:free"
+];
 
 function temizJson(metin) {
   if (!metin || typeof metin !== "string") return null;
-  let temiz = metin.trim();
-  temiz = temiz.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+  let temiz = metin.trim()
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+
   try { return JSON.parse(temiz); } catch (_) {}
+
   const baslangic = temiz.indexOf("{");
-  if (baslangic === -1) return null;
+  if (baslangic === -1) {
+    console.error("[JSON PARSE] JSON nesnesi bulunamadı.");
+    console.error("[MODEL CEVABI]", temiz.substring(0, 1000));
+    return null;
+  }
+
   let derinlik = 0, stringIcinde = false, escape = false;
   for (let i = baslangic; i < temiz.length; i++) {
     const karakter = temiz[i];
@@ -25,7 +42,11 @@ function temizJson(metin) {
     else if (karakter === "}") {
       derinlik--;
       if (derinlik === 0) {
-        try { return JSON.parse(temiz.substring(baslangic, i + 1)); } catch (_) { return null; }
+        try { return JSON.parse(temiz.substring(baslangic, i + 1)); }
+        catch (e) {
+          console.error("[JSON PARSE HATASI]", e.message);
+          return null;
+        }
       }
     }
   }
@@ -52,19 +73,23 @@ async function openRouterSoruIste({ apiKey, model, prompt, signal }) {
     body: JSON.stringify({
       model,
       messages: [
-        { role: "system", content: "Sen KPSS Ortaogretim icin kaliteli, ozgun ve dogru test sorulari hazirlayan uzman bir ogretmensin. Cevabin yalnizca gecerli JSON nesnesi olmalidir. JSON disinda tek bir karakter bile yazma." },
+        { role: "system", content: "Sen KPSS Ortaöğretim için kaliteli ve özgün test soruları hazırlayan uzman bir öğretmensin. Yalnızca geçerli JSON nesnesi döndür." },
         { role: "user", content: prompt }
       ],
-      temperature: 0.2,
+      temperature: 0.15,
       max_tokens: 6000,
       response_format: { type: "json_object" }
     }),
     signal
   });
+
   const responseText = await response.text();
-  if (!response.ok) throw new Error(`OpenRouter API ${response.status}`);
+  if (!response.ok) throw new Error(`OpenRouter API ${response.status}: ${responseText.substring(0, 500)}`);
+
   let data;
-  try { data = JSON.parse(responseText); } catch (_) { throw new Error("OpenRouter cevabi JSON olarak okunamadi."); }
+  try { data = JSON.parse(responseText); }
+  catch (_) { throw new Error("OpenRouter cevabi JSON olarak okunamadi."); }
+
   const content = data?.choices?.[0]?.message?.content;
   if (!content) throw new Error("OpenRouter bos cevap dondurdu.");
   return content;
@@ -88,8 +113,7 @@ async function sorulariUret(istekler) {
 
   const toplamIstenen = Math.min(MAX_SORU, konular.reduce((t, k) => t + k.count, 0));
   const konuMetni = konular.map((k, i) => `${i + 1}. Ders: ${k.subject}\nKonu: ${k.topic}\nZorluk: ${k.difficulty}\nSoru sayısı: ${k.count}`).join("\n\n");
-  const prompt = `
-Sen Türkiye'deki 2026 KPSS Ortaöğretim sınavına hazırlanan öğrenciler için soru hazırlayan uzman bir KPSS öğretmenisin.
+  const prompt = `Sen Türkiye'deki KPSS Ortaöğretim sınavına hazırlanan öğrenciler için soru hazırlayan uzman bir KPSS öğretmenisin.
 
 Aşağıdaki ders ve konulara göre TAM OLARAK ${toplamIstenen} adet soru üret.
 
@@ -97,30 +121,37 @@ DERSLER:
 ${konuMetni}
 
 KURALLAR:
-1. Sorular KPSS Ortaöğretim seviyesinde olsun.
+1. KPSS Ortaöğretim seviyesinde, özgün ve açık Türkçe kullan.
 2. Her soru 5 seçenekli olsun: A, B, C, D, E.
-3. Her soruda yalnızca BİR doğru cevap olsun.
+3. Yalnızca bir doğru cevap olsun.
 4. dogruCevap yalnızca A, B, C, D veya E olsun.
-5. Sorular özgün ve açık Türkçe ile yazılsın.
-6. Şıklar mantıklı çeldiriciler içersin.
-7. Aynı soruyu tekrar etme.
-8. Her sorunun kısa açıklaması olsun.
-9. JSON içindeki metinler geçerli JSON stringleri olmalıdır.
-10. JSON dışında hiçbir açıklama, markdown veya kod bloğu yazma.
+5. Mantıklı çeldiriciler kullan.
+6. Bilgi ve hesaplamaları kontrol et.
+7. Her soruya kısa açıklama ekle.
+8. JSON dışında hiçbir açıklama, markdown veya kod bloğu yazma.
+9. Tüm metinler geçerli JSON stringleri olmalı.
 
 SADECE şu yapıda geçerli JSON döndür:
-{"sorular":[{"subject":"Türkçe","topic":"Sözcükte Anlam","soru":"Soru metni","secenekler":{"A":"...","B":"...","C":"...","D":"...","E":"..."},"dogruCevap":"A","aciklama":"Kısa açıklama"}]}`;
+{"sorular":[{"subject":"Türkçe","topic":"Sözcükte Anlam","soru":"Soru metni","secenekler":{"A":"A seçeneği","B":"B seçeneği","C":"C seçeneği","D":"D seçeneği","E":"E seçeneği"},"dogruCevap":"A","aciklama":"Kısa açıklama"}]}`;
 
-  const model = process.env.OPENROUTER_MODEL || "openrouter/free";
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
   try {
     let sonHata = null;
     for (let deneme = 1; deneme <= MAX_JSON_DENEME; deneme++) {
+      const model = SORU_MODELLERI[(deneme - 1) % SORU_MODELLERI.length];
       try {
-        console.log(`[OpenRouter] ${toplamIstenen} soru isteniyor. Model: ${model}. Deneme: ${deneme}/${MAX_JSON_DENEME}`);
+        console.log(`[OpenRouter] ${toplamIstenen} soru isteniyor. Model: ${model}`);
+        console.log(`[OpenRouter] JSON üretim denemesi: ${deneme}/${MAX_JSON_DENEME}`);
+
         const content = await openRouterSoruIste({ apiKey, model, prompt, signal: controller.signal });
         console.log(`[OpenRouter] Cevap alindi. Uzunluk: ${content.length}`);
+
+        if (/^(User Safety|Safety)\s*:/i.test(content.trim())) {
+          throw new Error(`Model moderasyon çıktısı döndürdü: ${content.trim().substring(0, 200)}`);
+        }
+
         const sonuc = temizJson(content);
         if (!sonuc) { sonHata = new Error("Yapay zeka gecerli JSON uretmedi."); continue; }
         const sorular = Array.isArray(sonuc) ? sonuc : (Array.isArray(sonuc.sorular) ? sonuc.sorular : []);
@@ -133,7 +164,13 @@ SADECE şu yapıda geçerli JSON döndür:
           dogruCevap: String(soru.dogruCevap).toUpperCase(),
           aciklama: String(soru.aciklama || "")
         }));
-        if (gecerliSorular.length === 0) { sonHata = new Error("Yapay zekadan gecerli soru alinamadi."); continue; }
+
+        if (gecerliSorular.length < toplamIstenen) {
+          sonHata = new Error(`Model ${toplamIstenen} soru yerine ${gecerliSorular.length} geçerli soru üretti.`);
+          continue;
+        }
+
+        console.log(`[OpenRouter] ${gecerliSorular.length} soru hazir.`);
         return gecerliSorular;
       } catch (err) {
         if (err.name === "AbortError") throw err;
