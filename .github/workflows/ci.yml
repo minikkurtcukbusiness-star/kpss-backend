@@ -1,0 +1,35 @@
+name: Backend CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check JavaScript syntax
+        run: |
+          node --check server.js
+          node --check db/db.js
+          node --check middleware/rateLimit.js
+          node --check routes/ai.js
+          node --check routes/admin.js
+          node --check routes/currentAffairs.js
+          node --check routes/progress.js
+          node --check routes/questions.js
+          node --check routes/search.js
+          node --check services/aiProvider.js
+          node --check services/cache.js
+          node --check services/webSearch.js
+          node --check services/providers/gemini.js
