@@ -4,27 +4,24 @@ const router = express.Router();
 const MAX_SORU = 5;
 const MOCK_EXAM_SORU = 20;
 const TIMEOUT_MS = 110000;
-const MAX_JSON_DENEME = 3;
+const MAX_JSON_DENEME = 4;
 
-// Sadece OpenRouter'da doğrulanmış model kimlikleri kullanılır.
-// openrouter/free bilerek kullanılmıyor: router her istekte farklı bir ücretsiz model
-// seçebildiği için bazen "User Safety: safe" gibi moderasyon çıktısı döndürebiliyor.
-// Nemotron'un doğru slug'ı da tam sürüm adını içeriyor.
+// 2026-08 itibarıyla OpenRouter'da gerçekten ücretsiz olan ve soru üretiminde
+// kullanılabilecek sabit modeller. Qwen3 Next :free varyantı artık ücretsiz değil;
+// bu yüzden kesinlikle listeye alınmıyor. openrouter/free de kullanılmıyor çünkü
+// rastgele model seçimi üretim kararlılığını bozabiliyor.
 const VARSAYILAN_SORU_MODELLERI = [
-  "qwen/qwen3-next-80b-a3b-instruct:free",
-  "nvidia/nemotron-3-ultra-550b-a55b:free"
+  "nvidia/nemotron-3-ultra-550b-a55b:free",
+  "meta-llama/llama-3.3-70b-instruct:free"
 ];
 
 function modelListesi() {
+  // OPENROUTER_MODEL yalnızca bilinen, güncel ücretsiz modellerden biri ise
+  // önceliklendir. Eski/ücretli model değişkenleri tamamen yok sayılır.
   const envModel = String(process.env.OPENROUTER_MODEL || "").trim();
-  const yasakliEskiModeller = new Set([
-    "openrouter/free",
-    "nvidia/nemotron-3-ultra:free",
-    "nvidia/nemotron-3-ultra"
-  ]);
+  const izinli = new Set(VARSAYILAN_SORU_MODELLERI);
   const adaylar = [envModel, ...VARSAYILAN_SORU_MODELLERI]
-    .filter(Boolean)
-    .filter(model => !yasakliEskiModeller.has(model));
+    .filter(model => izinli.has(model));
   return [...new Set(adaylar)];
 }
 
@@ -38,8 +35,6 @@ function temizJson(metin) {
 
   try { return JSON.parse(temiz); } catch (_) {}
 
-  // Model bazen JSON'dan önce/sonra kısa açıklama yazabiliyor.
-  // Hem nesne hem dizi için dengeli biçimde JSON bloğunu bul.
   const baslangicNesne = temiz.indexOf("{");
   const baslangicDizi = temiz.indexOf("[");
   let baslangic = -1;
@@ -172,6 +167,8 @@ async function sorulariUret(istekler) {
   try {
     let sonHata = null;
     for (let deneme = 1; deneme <= MAX_JSON_DENEME; deneme++) {
+      // Her denemede farklı sağlam bir model kullan; geçici rate-limit veya
+      // provider arızası tüm denemeyi bozmasın.
       const model = modeller[(deneme - 1) % modeller.length];
       try {
         console.log(`[OpenRouter] ${toplamIstenen} soru isteniyor. Model: ${model}`);
@@ -273,11 +270,12 @@ router.post("/generate-mock-exam", async (req, res) => {
       tumSorular.push(...batchSorular.slice(0, 5));
     }
 
+    console.log(`[ai/generate-mock-exam] Deneme hazır: ${tumSorular.length}/20 soru.`);
     return res.json({ ok: true, sorular: tumSorular.slice(0, MOCK_EXAM_SORU), soruSayisi: tumSorular.length });
   } catch (err) {
     if (err.name === "AbortError") return res.status(504).json({ hata: "Deneme hazırlanırken zaman aşımı oluştu. Lütfen tekrar deneyin." });
-    console.error("[ai/generate-mock-exam]", err.message);
-    return res.status(503).json({ hata: "20 soruluk deneme şu anda hazırlanamadı. Lütfen tekrar deneyin." });
+    console.error("[ai/generate-mock-exam]`, err.message);
+    return res.status(503).json({ hata: "20 soruluk deneme şu anda hazırlanamadı. Lütfen tekrar deneyin.", ayrinti: err.message });
   }
 });
 
