@@ -17,9 +17,15 @@ const VARSAYILAN_SORU_MODELLERI = [
 
 function modelListesi() {
   const envModel = String(process.env.OPENROUTER_MODEL || "").trim();
-  const adaylar = envModel ? [envModel, ...VARSAYILAN_SORU_MODELLERI] : VARSAYILAN_SORU_MODELLERI;
-  // Aynı modeli iki kez denemeyi önle; boş/yanlış eski env değerini de filtrele.
-  return [...new Set(adaylar.filter(Boolean))];
+  const yasakliEskiModeller = new Set([
+    "openrouter/free",
+    "nvidia/nemotron-3-ultra:free",
+    "nvidia/nemotron-3-ultra"
+  ]);
+  const adaylar = [envModel, ...VARSAYILAN_SORU_MODELLERI]
+    .filter(Boolean)
+    .filter(model => !yasakliEskiModeller.has(model));
+  return [...new Set(adaylar)];
 }
 
 function temizJson(metin) {
@@ -166,8 +172,6 @@ async function sorulariUret(istekler) {
   try {
     let sonHata = null;
     for (let deneme = 1; deneme <= MAX_JSON_DENEME; deneme++) {
-      // Model değiştirmek yerine önce aynı kararlı modeli tekrar deniyoruz.
-      // Böylece geçici JSON/sağlayıcı hatasında rastgele bir modele düşmüyoruz.
       const model = modeller[(deneme - 1) % modeller.length];
       try {
         console.log(`[OpenRouter] ${toplamIstenen} soru isteniyor. Model: ${model}`);
