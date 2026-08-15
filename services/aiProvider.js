@@ -4,86 +4,13 @@
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const MODELLER = [
   "nvidia/nemotron-3-ultra-550b-a55b:free",
-  "meta-llama/llama-3.3-70b-instruct:free"
+  "openai/gpt-oss-120b:free"
 ];
 const TIMEOUT_MS = 70000;
 
-function getApiKey() {
-  const key = String(process.env.OPENROUTER_API_KEY || "").trim();
-  if (!key) throw new Error("OPENROUTER_API_KEY Railway Variables bölümünde tanımlı değil.");
-  return key;
-}
-
-function getModels() {
-  const env = String(process.env.OPENROUTER_MODEL || "").trim();
-  return [...new Set([env, ...MODELLER].filter(m => MODELLER.includes(m)))];
-}
-
-async function request(body, timeoutMs = TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(OPENROUTER_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${getApiKey()}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": process.env.APP_URL || "https://kpss-backend-production.up.railway.app",
-        "X-Title": "KPSS-2026"
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal
-    });
-    const text = await response.text();
-    let data = {};
-    try { data = JSON.parse(text); } catch (_) {}
-    if (!response.ok) throw new Error(`OpenRouter API ${response.status}: ${data?.error?.message || text.slice(0, 500)}`);
-    return data;
-  } finally { clearTimeout(timer); }
-}
-
-async function generate({ system, prompt, jsonMode = false }) {
-  let lastError = null;
-  for (const model of getModels()) {
-    try {
-      const messages = [];
-      if (system) messages.push({ role: "system", content: String(system) });
-      messages.push({ role: "user", content: String(prompt) });
-      const base = { model, messages, temperature: 0.2, max_tokens: 5000 };
-      let data;
-      try {
-        data = await request(jsonMode ? { ...base, response_format: { type: "json_object" } } : base);
-      } catch (err) {
-        // Bazı ücretsiz modeller response_format desteklemeyebilir; aynı modelde bir kez daha düz istek dene.
-        if (jsonMode && /response.?format|json_object|unsupported/i.test(err.message)) data = await request(base);
-        else throw err;
-      }
-      const content = data?.choices?.[0]?.message?.content;
-      if (!content) throw new Error("OpenRouter AI boş cevap döndürdü.");
-      if (/^(User Safety|Safety)\s*:/i.test(String(content).trim())) throw new Error("Model güvenlik yönlendirmesi döndürdü; başka modele geçiliyor.");
-      console.log(`[AI Provider] başarılı model: ${model}`);
-      return content;
-    } catch (err) {
-      lastError = err;
-      console.error(`[AI Provider] ${model} başarısız: ${err.message}`);
-    }
-  }
-  throw lastError || new Error("Kullanılabilir AI modeli bulunamadı.");
-}
-
-async function generateWithImage({ system, prompt, imageBase64, mimeType = "image/jpeg" }) {
-  if (!imageBase64) throw new Error("Görsel verisi gönderilmedi.");
-  const visionModel = String(process.env.OPENROUTER_VISION_MODEL || "qwen/qwen2.5-vl-32b-instruct:free").trim();
-  const messages = [];
-  if (system) messages.push({ role: "system", content: String(system) });
-  messages.push({ role: "user", content: [
-    { type: "text", text: String(prompt) },
-    { type: "image_url", image_url: { url: `data:${mimeType};base64,${imageBase64}` } }
-  ]});
-  const data = await request({ model: visionModel, messages, temperature: 0.1, max_tokens: 4000, response_format: { type: "json_object" } }, 90000);
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content) throw new Error("Görsel AI boş cevap döndürdü.");
-  return content;
-}
-
-module.exports = { generate, generateWithImage, getModels };
+function getApiKey(){const key=String(process.env.OPENROUTER_API_KEY||"").trim();if(!key)throw new Error("OPENROUTER_API_KEY Railway Variables bölümünde tanımlı değil.");return key;}
+function getModels(){const env=String(process.env.OPENROUTER_MODEL||"").trim();return [...new Set([env,...MODELLER].filter(m=>MODELLER.includes(m)))];}
+async function request(body,timeoutMs=TIMEOUT_MS){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeoutMs);try{const response=await fetch(OPENROUTER_URL,{method:"POST",headers:{Authorization:`Bearer ${getApiKey()}`,"Content-Type":"application/json","HTTP-Referer":process.env.APP_URL||"https://kpss-backend-production.up.railway.app","X-Title":"KPSS-2026"},body:JSON.stringify(body),signal:controller.signal});const text=await response.text();let data={};try{data=JSON.parse(text)}catch(_){}if(!response.ok)throw new Error(`OpenRouter API ${response.status}: ${data?.error?.message||text.slice(0,500)}`);return data;}finally{clearTimeout(timer);}}
+async function generate({system,prompt,jsonMode=false}){let lastError=null;for(const model of getModels()){try{const messages=[];if(system)messages.push({role:"system",content:String(system)});messages.push({role:"user",content:String(prompt)});const base={model,messages,temperature:0.2,max_tokens:5000};let data;try{data=await request(jsonMode?{...base,response_format:{type:"json_object"}}:base);}catch(err){if(jsonMode&&/response.?format|json_object|unsupported/i.test(err.message))data=await request(base);else throw err;}const content=data?.choices?.[0]?.message?.content;if(!content)throw new Error("OpenRouter AI boş cevap döndürdü.");if(/^(User Safety|Safety)\s*:/i.test(String(content).trim()))throw new Error("Model güvenlik yönlendirmesi döndürdü; başka modele geçiliyor.");console.log(`[AI Provider] başarılı model: ${model}`);return content;}catch(err){lastError=err;console.error(`[AI Provider] ${model} başarısız: ${err.message}`);}}throw lastError||new Error("Kullanılabilir AI modeli bulunamadı.");}
+async function generateWithImage({system,prompt,imageBase64,mimeType="image/jpeg"}){if(!imageBase64)throw new Error("Görsel verisi gönderilmedi.");const visionModel=String(process.env.OPENROUTER_VISION_MODEL||"qwen/qwen2.5-vl-32b-instruct:free").trim();const messages=[];if(system)messages.push({role:"system",content:String(system)});messages.push({role:"user",content:[{type:"text",text:String(prompt)},{type:"image_url",image_url:{url:`data:${mimeType};base64,${imageBase64}`}}]});const data=await request({model:visionModel,messages,temperature:0.1,max_tokens:4000,response_format:{type:"json_object"}},90000);const content=data?.choices?.[0]?.message?.content;if(!content)throw new Error("Görsel AI boş cevap döndürdü.");return content;}
+module.exports={generate,generateWithImage,getModels};
