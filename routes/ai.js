@@ -1,233 +1,212 @@
 const express = require("express");
+const aiProvider = require("../services/aiProvider");
 const router = express.Router();
 
-const MAX_SORU = 5;
+const MAX_SORU_PAKET = 5;
+const MAX_TEST = 40;
 const MOCK_EXAM_SORU = 20;
 const TIMEOUT_MS = 110000;
-const MAX_JSON_DENEME = 4;
+const MAX_JSON_DENEME = 3;
 
-// 2026-08 itibarıyla OpenRouter'da gerçekten ücretsiz olan ve soru üretiminde
-// kullanılabilecek sabit modeller. Qwen3 Next :free varyantı artık ücretsiz değil;
-// bu yüzden kesinlikle listeye alınmıyor. openrouter/free de kullanılmıyor çünkü
-// rastgele model seçimi üretim kararlılığını bozabiliyor.
-const VARSAYILAN_SORU_MODELLERI = [
-  "nvidia/nemotron-3-ultra-550b-a55b:free",
-  "meta-llama/llama-3.3-70b-instruct:free"
-];
-
-function modelListesi() {
-  const envModel = String(process.env.OPENROUTER_MODEL || "").trim();
-  const izinli = new Set(VARSAYILAN_SORU_MODELLERI);
-  const adaylar = [envModel, ...VARSAYILAN_SORU_MODELLERI].filter(model => izinli.has(model));
-  return [...new Set(adaylar)];
-}
+function modelListesi() { return aiProvider.getModels(); }
 
 function temizJson(metin) {
   if (!metin || typeof metin !== "string") return null;
   let temiz = metin.trim().replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
   try { return JSON.parse(temiz); } catch (_) {}
-  const baslangicNesne = temiz.indexOf("{");
-  const baslangicDizi = temiz.indexOf("[");
-  let baslangic = -1;
-  if (baslangicNesne === -1) baslangic = baslangicDizi;
-  else if (baslangicDizi === -1) baslangic = baslangicNesne;
-  else baslangic = Math.min(baslangicNesne, baslangicDizi);
-  if (baslangic === -1) return null;
-  const acilis = temiz[baslangic];
-  const kapanis = acilis === "{" ? "}" : "]";
-  let derinlik = 0, stringIcinde = false, escape = false;
-  for (let i = baslangic; i < temiz.length; i++) {
-    const karakter = temiz[i];
-    if (escape) { escape = false; continue; }
-    if (karakter === "\\" && stringIcinde) { escape = true; continue; }
-    if (karakter === '"') { stringIcinde = !stringIcinde; continue; }
-    if (stringIcinde) continue;
-    if (karakter === acilis) derinlik++;
-    else if (karakter === kapanis) {
-      derinlik--;
-      if (derinlik === 0) {
-        try { return JSON.parse(temiz.substring(baslangic, i + 1)); } catch (_) { return null; }
-      }
-    }
+  const bas = Math.min(...[temiz.indexOf("{"), temiz.indexOf("[")].filter(x => x >= 0));
+  if (!Number.isFinite(bas)) return null;
+  const ac = temiz[bas], kap = ac === "{" ? "}" : "]";
+  let depth = 0, str = false, esc = false;
+  for (let i = bas; i < temiz.length; i++) {
+    const c = temiz[i];
+    if (esc) { esc = false; continue; }
+    if (c === "\\" && str) { esc = true; continue; }
+    if (c === '"') { str = !str; continue; }
+    if (str) continue;
+    if (c === ac) depth++;
+    if (c === kap && --depth === 0) { try { return JSON.parse(temiz.slice(bas, i + 1)); } catch (_) { return null; } }
   }
   return null;
 }
 
-function soruGecerliMi(soru) {
-  if (!soru || typeof soru !== "object" || !soru.soru || typeof soru.soru !== "string") return false;
-  if (!soru.secenekler || typeof soru.secenekler !== "object") return false;
-  const harfler = ["A", "B", "C", "D", "E"];
-  if (!harfler.every(h => typeof soru.secenekler[h] === "string" && soru.secenekler[h].trim())) return false;
-  return harfler.includes(String(soru.dogruCevap || "").toUpperCase());
+function soruGecerliMi(s) {
+  if (!s || typeof s !== "object" || typeof s.soru !== "string" || !s.soru.trim()) return false;
+  const sec = s.secenekler;
+  if (!sec || typeof sec !== "object") return false;
+  if (!["A","B","C","D","E"].every(h => typeof sec[h] === "string" && sec[h].trim())) return false;
+  return ["A","B","C","D","E"].includes(String(s.dogruCevap || "").toUpperCase());
 }
 
-async function openRouterSoruIste({ apiKey, model, prompt, signal }) {
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": process.env.APP_URL || "https://kpss-backend-production.up.railway.app",
-      "X-Title": "KPSS-2026"
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: "Sen KPSS Ortaöğretim için kaliteli ve özgün test soruları hazırlayan uzman bir öğretmensin. ÇIKTIYI SADECE GEÇERLİ JSON OLARAK VER. JSON dışında tek karakter açıklama yazma." },
-        { role: "user", content: prompt }
-      ],
-      temperature: 0.1,
-      max_tokens: 6000,
-      response_format: { type: "json_object" }
-    }),
-    signal
-  });
-  const responseText = await response.text();
-  if (!response.ok) throw new Error(`OpenRouter API ${response.status}: ${responseText.substring(0, 500)}`);
-  let data;
-  try { data = JSON.parse(responseText); } catch (_) { throw new Error("OpenRouter cevabi JSON olarak okunamadi."); }
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content) throw new Error("OpenRouter bos cevap dondurdu.");
-  return content;
+function promptOlustur(konular, toplam, tur = 0, oncekiler = []) {
+  const konuMetni = konular.map((k,i) => `${i+1}. Ders: ${k.subject}\nKonu: ${k.topic}\nZorluk: ${k.difficulty}\nSoru: ${k.count}`).join("\n\n");
+  const onceki = oncekiler.length ? `\nÖNCEKİ SORULARIN İLK CÜMLELERİ; BUNLARA BENZER SORU ÜRETME:\n${oncekiler.slice(-12).map(x=>`- ${x}`).join("\n")}` : "";
+  return `Türkiye KPSS Ortaöğretim için uzman öğretmen olarak TAM OLARAK ${toplam} özgün çoktan seçmeli soru üret.
+${tur ? "Önceki üretim başarısız oldu; JSON sözdizimini özellikle kontrol et." : ""}
+${konuMetni}${onceki}
+
+Kurallar:
+- Her soru A,B,C,D,E olmak üzere 5 seçenekli ve tek doğru cevaplıdır.
+- KPSS seviyesinde, açık Türkçe, gerçekçi çeldiriciler kullan.
+- Hesaplamaları ve tarihsel bilgileri kontrol et.
+- Her soruda kısa öğretici açıklama bulunur.
+- Aynı soru, aynı seçenek dizilimi veya bariz varyasyonları tekrar etme.
+- JSON dışında hiçbir şey yazma.
+- Türkçe karakterler geçerli JSON stringi olarak yazılmalı.
+
+SADECE şu JSON yapısını döndür:
+{"sorular":[{"subject":"Türkçe","topic":"...","soru":"...","secenekler":{"A":"...","B":"...","C":"...","D":"...","E":"..."},"dogruCevap":"A","aciklama":"..."}]}`;
 }
 
-function promptOlustur(konular, toplamIstenen, tekrarNo = 0) {
-  const konuMetni = konular.map((k, i) => `${i + 1}. Ders: ${k.subject}\nKonu: ${k.topic}\nZorluk: ${k.difficulty}\nSoru sayısı: ${k.count}`).join("\n\n");
-  const tekrarUyari = tekrarNo > 0 ? `\nÖNEMLİ: Önceki üretim geçerli JSON olarak doğrulanamadı. Bu kez JSON sözdizimini özellikle kontrol et. JSON dışında hiçbir şey yazma.\n` : "";
-  return `Sen Türkiye'deki KPSS Ortaöğretim sınavına hazırlanan öğrenciler için soru hazırlayan uzman bir KPSS öğretmenisin.
-
-Aşağıdaki ders ve konulara göre TAM OLARAK ${toplamIstenen} adet soru üret.
-${tekrarUyari}
-DERSLER:
-${konuMetni}
-
-KURALLAR:
-1. KPSS Ortaöğretim seviyesinde, özgün ve açık Türkçe kullan.
-2. Her soru 5 seçenekli olsun: A, B, C, D, E.
-3. Yalnızca bir doğru cevap olsun.
-4. dogruCevap yalnızca A, B, C, D veya E olsun.
-5. Mantıklı çeldiriciler kullan.
-6. Bilgi ve hesaplamaları kontrol et.
-7. Her soruya kısa ve öğretici açıklama ekle.
-8. Aynı soruyu veya seçenekleri tekrar etme.
-9. JSON dışında hiçbir açıklama, markdown, kod bloğu veya selamlama yazma.
-10. Tüm metinler geçerli JSON stringleri olmalı; çift tırnakları gerektiğinde escape et.
-
-SADECE şu yapıda geçerli JSON döndür:
-{"sorular":[{"subject":"Türkçe","topic":"Sözcükte Anlam","soru":"Soru metni","secenekler":{"A":"A seçeneği","B":"B seçeneği","C":"C seçeneği","D":"D seçeneği","E":"E seçeneği"},"dogruCevap":"A","aciklama":"Kısa açıklama"}]}`;
-}
-
-async function sorulariUret(istekler) {
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) throw new Error("OPENROUTER_API_KEY Railway Variables bölümünde bulunamadı.");
-  const konular = [];
-  let kalan = MAX_SORU;
-  for (const istek of istekler || []) {
-    if (!istek || !istek.subject || kalan <= 0) continue;
-    let sayi = Number(istek.count);
-    if (!Number.isFinite(sayi) || sayi <= 0) sayi = 1;
-    sayi = Math.min(Math.floor(sayi), kalan);
-    konular.push({ subject: String(istek.subject), topic: String(istek.topic || "Genel"), difficulty: String(istek.difficulty || "orta"), count: sayi });
-    kalan -= sayi;
+async function paketUret(istekler, toplam, oncekiler = []) {
+  let lastError = null;
+  for (let deneme = 1; deneme <= MAX_JSON_DENEME; deneme++) {
+    try {
+      console.log(`[OpenRouter] ${toplam} soru isteniyor. JSON denemesi ${deneme}/${MAX_JSON_DENEME}`);
+      const content = await aiProvider.generate({
+        system: "Sen yalnızca geçerli JSON üreten KPSS soru yazarı ve öğretmensin. JSON dışında hiçbir şey yazma.",
+        prompt: promptOlustur(istekler, toplam, deneme - 1, oncekiler),
+        jsonMode: true
+      });
+      const parsed = temizJson(content);
+      const raw = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.sorular) ? parsed.sorular : []);
+      const valid = raw.filter(soruGecerliMi).slice(0, toplam).map((s,i) => ({
+        id:`ai-${Date.now()}-${i}-${Math.random().toString(36).slice(2,7)}`,
+        subject:s.subject || istekler[0]?.subject || "KPSS",
+        topic:s.topic || istekler[0]?.topic || "Genel",
+        soru:s.soru.trim(),
+        secenekler:{A:String(s.secenekler.A),B:String(s.secenekler.B),C:String(s.secenekler.C),D:String(s.secenekler.D),E:String(s.secenekler.E)},
+        dogruCevap:String(s.dogruCevap).toUpperCase(),
+        aciklama:String(s.aciklama || "")
+      }));
+      if (valid.length < toplam) throw new Error(`Model ${toplam} yerine ${valid.length} geçerli soru döndürdü.`);
+      return valid;
+    } catch (err) { lastError = err; console.error(`[OpenRouter] Paket denemesi ${deneme} başarısız: ${err.message}`); }
   }
-  if (!konular.length) konular.push({ subject: "Türkçe", topic: "Genel", difficulty: "orta", count: MAX_SORU });
-  const toplamIstenen = Math.min(MAX_SORU, konular.reduce((t, k) => t + k.count, 0));
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  const modeller = modelListesi();
-  try {
-    let sonHata = null;
-    for (let deneme = 1; deneme <= MAX_JSON_DENEME; deneme++) {
-      const model = modeller[(deneme - 1) % modeller.length];
-      try {
-        console.log(`[OpenRouter] ${toplamIstenen} soru isteniyor. Model: ${model}`);
-        console.log(`[OpenRouter] JSON üretim denemesi: ${deneme}/${MAX_JSON_DENEME}`);
-        const content = await openRouterSoruIste({ apiKey, model, prompt: promptOlustur(konular, toplamIstenen, deneme - 1), signal: controller.signal });
-        console.log(`[OpenRouter] Cevap alindi. Uzunluk: ${content.length}`);
-        if (/^(User Safety|Safety)\s*:/i.test(content.trim())) throw new Error(`Model moderasyon çıktısı döndürdü: ${content.trim().substring(0, 200)}`);
-        const sonuc = temizJson(content);
-        if (!sonuc) { sonHata = new Error("Yapay zeka gecerli JSON uretmedi."); continue; }
-        const sorular = Array.isArray(sonuc) ? sonuc : (Array.isArray(sonuc.sorular) ? sonuc.sorular : []);
-        const gecerliSorular = sorular.filter(soruGecerliMi).slice(0, MAX_SORU).map((soru, index) => ({
-          id: `ai-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 7)}`,
-          subject: soru.subject || "KPSS",
-          topic: soru.topic || "Genel",
-          soru: soru.soru.trim(),
-          secenekler: { A: String(soru.secenekler.A), B: String(soru.secenekler.B), C: String(soru.secenekler.C), D: String(soru.secenekler.D), E: String(soru.secenekler.E) },
-          dogruCevap: String(soru.dogruCevap).toUpperCase(),
-          aciklama: String(soru.aciklama || "")
-        }));
-        if (gecerliSorular.length < toplamIstenen) { sonHata = new Error(`Model ${toplamIstenen} soru yerine ${gecerliSorular.length} geçerli soru üretti.`); continue; }
-        console.log(`[OpenRouter] ${gecerliSorular.length} soru hazir.`);
-        return gecerliSorular;
-      } catch (err) {
-        if (err.name === "AbortError") throw err;
-        sonHata = err;
-        console.error(`[OpenRouter] Deneme ${deneme} basarisiz:`, err.message);
-      }
-    }
-    throw sonHata || new Error("Yapay zeka gecerli JSON uretmedi.");
-  } finally { clearTimeout(timeout); }
+  throw lastError || new Error("Geçerli soru üretilemedi.");
 }
 
-function mockExamBatchleriOlustur(istekler) {
-  const kalanlar = (istekler || []).map(x => ({ ...x, count: Math.max(0, Number(x.count) || 0) }));
-  const batchler = [];
-  while (kalanlar.some(x => x.count > 0) && batchler.length < 4) {
-    let kapasite = MAX_SORU;
-    const batch = [];
-    for (const item of kalanlar) {
-      if (kapasite <= 0) break;
-      if (item.count <= 0) continue;
-      const sayi = Math.min(item.count, kapasite);
-      batch.push({ ...item, count: sayi });
-      item.count -= sayi;
-      kapasite -= sayi;
-    }
-    if (batch.length) batchler.push(batch);
+function normalizeIstekler(istekler, toplam) {
+  const kaynak = Array.isArray(istekler) ? istekler : [];
+  const out = []; let kalan = toplam;
+  for (const x of kaynak) {
+    if (kalan <= 0 || !x?.subject) continue;
+    const count = Math.min(kalan, Math.max(1, Math.floor(Number(x.count) || 1)));
+    out.push({subject:String(x.subject),topic:String(x.topic || "Karışık"),difficulty:String(x.difficulty || "orta"),count});
+    kalan -= count;
   }
-  return batchler;
+  if (!out.length) out.push({subject:"Türkçe",topic:"Karışık",difficulty:"orta",count:toplam});
+  if (kalan > 0) out[out.length - 1].count += kalan;
+  return out;
 }
 
-router.post("/generate-mixed-test", async (req, res) => {
+async function testUret(istekler, toplam) {
+  toplam = Math.min(MAX_TEST, Math.max(1, Math.floor(Number(toplam) || 10)));
+  const norm = normalizeIstekler(istekler, toplam);
+  const paketler = [];
+  let kalan = toplam;
+  let offset = 0;
+  while (kalan > 0) {
+    const adet = Math.min(MAX_SORU_PAKET, kalan);
+    const batch = norm.map(x => ({...x,count:0}));
+    // Ders dağılımını koruyarak her pakete sırayla soru paylaştır.
+    let cap = adet;
+    for (const x of norm) {
+      if (cap <= 0) break;
+      const already = Math.min(x.count, offset);
+      const available = Math.max(0, x.count - already);
+      const take = Math.min(available, cap);
+      if (take) { batch.find(b=>b.subject===x.subject && b.topic===x.topic).count += take; cap -= take; }
+    }
+    // dağıtımın sınırlarında boş kalırsa genel karışık paket kullan.
+    if (batch.every(x=>x.count===0)) batch[0].count = adet;
+    paketler.push(batch.filter(x=>x.count>0));
+    offset += adet; kalan -= adet;
+  }
+  const all = []; const oncekiler=[];
+  for (let i=0;i<paketler.length;i++) {
+    console.log(`[ai/test] Paket ${i+1}/${paketler.length}: ${paketler[i].reduce((t,x)=>t+x.count,0)} soru.`);
+    const qs = await paketUret(paketler[i], paketler[i].reduce((t,x)=>t+x.count,0), oncekiler);
+    all.push(...qs); qs.forEach(q=>oncekiler.push(q.soru.slice(0,140)));
+  }
+  return all.slice(0,toplam);
+}
+
+router.post("/teacher", async (req,res) => {
+  const soru = String(req.body?.soru || "").trim();
+  if (!soru) return res.status(400).json({hata:"Lütfen bir soru yaz."});
   try {
-    const { istekler } = req.body || {};
-    if (!Array.isArray(istekler) || !istekler.length) return res.status(400).json({ hata: "Ders ve konu bilgisi gonderilmedi." });
-    console.log("[ai/generate-mixed-test] Test hazirlaniyor...");
-    const sorular = await sorulariUret(istekler);
-    if (!sorular?.length) return res.status(503).json({ hata: "Yapay zeka soru olusturamadi. Lutfen tekrar deneyin." });
-    console.log(`[ai/generate-mixed-test] ${sorular.length} soru basariyla hazirlandi.`);
-    return res.json({ ok: true, sorular });
+    const cevap = await aiProvider.generate({
+      system:"Sen KPSS Ortaöğretim öğrencisinin kişisel AI öğretmenisin. Türkçe, anlaşılır ve öğretici cevap ver. Gerektiğinde konuyu adım adım anlat, örnek ver ve en sonda kısa bir mini kontrol sorusu sor. Bilmediğin güncel bilgiyi kesinmiş gibi uydurma.",
+      prompt:`Öğrencinin sorusu:\n${soru}`,
+      jsonMode:false
+    });
+    return res.json({ok:true,cevap:String(cevap),kaynaklar:[],belirsiz:false});
   } catch (err) {
-    if (err.name === "AbortError") return res.status(504).json({ hata: "Soru olusturma islemi zaman asimina ugradi. Lutfen tekrar deneyin." });
-    console.error("[ai/generate-mixed-test]", err.message);
-    return res.status(503).json({ hata: "Yapay zeka servisine ulasilamadi. Lutfen tekrar deneyin." });
+    console.error("[ai/teacher]",err.message);
+    return res.status(503).json({hata:"AI Öğretmen şu anda cevap veremedi. Lütfen tekrar dene."});
   }
 });
 
-router.post("/generate-mock-exam", async (req, res) => {
+router.post("/generate-questions", async (req,res) => {
   try {
-    const { istekler } = req.body || {};
-    if (!Array.isArray(istekler) || !istekler.length) return res.status(400).json({ hata: "Deneme için ders ve konu bilgisi gönderilmedi." });
-    const batchler = mockExamBatchleriOlustur(istekler);
-    if (batchler.length !== 4) return res.status(400).json({ hata: "Deneme 20 soru için yeterli soru dağılımı oluşturulamadı." });
+    const {subject,topic,difficulty,count} = req.body || {};
+    const toplam = Math.min(MAX_TEST, Math.max(1, Math.floor(Number(count) || 10)));
+    const sorular = await testUret([{subject:subject || "Türkçe",topic:topic || "Karışık",difficulty:difficulty || "orta",count:toplam}], toplam);
+    if (sorular.length !== toplam) throw new Error(`Beklenen ${toplam}, üretilen ${sorular.length}.`);
+    res.json({ok:true,sorular,soruSayisi:sorular.length});
+  } catch(err) {
+    console.error("[ai/generate-questions]",err.message);
+    res.status(err.name === "AbortError" ? 504 : 503).json({hata:`${Number(req.body?.count)||10} soruluk test hazırlanamadı. Lütfen tekrar deneyin.`});
+  }
+});
+
+router.post("/generate-mixed-test", async (req,res) => {
+  try {
+    const istekler = req.body?.istekler;
+    if (!Array.isArray(istekler) || !istekler.length) return res.status(400).json({hata:"Ders ve konu bilgisi gönderilmedi."});
+    const toplam = Math.min(MAX_SORU_PAKET, istekler.reduce((t,x)=>t+Math.max(0,Number(x.count)||0),0) || 5);
+    const sorular = await testUret(istekler, toplam);
+    res.json({ok:true,sorular});
+  } catch(err) {
+    console.error("[ai/generate-mixed-test]",err.message);
+    res.status(503).json({hata:"Yapay zeka soru servisi şu anda kullanılamıyor. Lütfen tekrar deneyin."});
+  }
+});
+
+router.post("/generate-mock-exam", async (req,res) => {
+  try {
+    const istekler = req.body?.istekler;
+    if (!Array.isArray(istekler) || !istekler.length) return res.status(400).json({hata:"Deneme için ders ve konu bilgisi gönderilmedi."});
     console.log("[ai/generate-mock-exam] 20 soruluk deneme hazırlanıyor; 4 x 5 soru.");
-    const tumSorular = [];
-    for (let i = 0; i < batchler.length; i++) {
-      console.log(`[ai/generate-mock-exam] Paket ${i + 1}/4 hazırlanıyor.`);
-      const batchSorular = await sorulariUret(batchler[i]);
-      if (!batchSorular || batchSorular.length < 5) throw new Error(`Deneme ${i + 1}. soru paketi tamamlanamadı.`);
-      tumSorular.push(...batchSorular.slice(0, 5));
-    }
-    console.log(`[ai/generate-mock-exam] Deneme hazır: ${tumSorular.length}/20 soru.`);
-    return res.json({ ok: true, sorular: tumSorular.slice(0, MOCK_EXAM_SORU), soruSayisi: tumSorular.length });
-  } catch (err) {
-    if (err.name === "AbortError") return res.status(504).json({ hata: "Deneme hazırlanırken zaman aşımı oluştu. Lütfen tekrar deneyin." });
-    console.error("[ai/generate-mock-exam]", err.message);
-    return res.status(503).json({ hata: "20 soruluk deneme şu anda hazırlanamadı. Lütfen tekrar deneyin.", ayrinti: err.message });
+    const sorular = await testUret(istekler, MOCK_EXAM_SORU);
+    if (sorular.length !== MOCK_EXAM_SORU) throw new Error(`Deneme ${MOCK_EXAM_SORU} yerine ${sorular.length} soru üretti.`);
+    console.log("[ai/generate-mock-exam] Deneme hazır: 20/20 soru.");
+    res.json({ok:true,sorular,soruSayisi:sorular.length});
+  } catch(err) {
+    console.error("[ai/generate-mock-exam]",err.message);
+    res.status(503).json({hata:"20 soruluk deneme şu anda hazırlanamadı. Lütfen tekrar deneyin."});
   }
 });
 
-router.get("/health", (req, res) => res.json({ ok: true, servis: "KPSS AI", sistem: "OpenRouter", modeller: modelListesi(), maksimumSoru: MAX_SORU, denemeSoru: MOCK_EXAM_SORU }));
+router.post("/solve-image", async (req,res) => {
+  try {
+    const imageBase64 = String(req.body?.imageBase64 || "");
+    const mimeType = String(req.body?.mimeType || "image/jpeg");
+    if (!imageBase64) return res.status(400).json({hata:"Görsel gönderilmedi."});
+    const content = await aiProvider.generateWithImage({
+      system:"KPSS sorusunun görselini dikkatle oku. Yalnızca geçerli JSON döndür.",
+      prompt:"Soruyu çöz ve şu JSON formatında cevap ver: {\"soru\":\"...\",\"secenekler\":{\"A\":\"...\",\"B\":\"...\",\"C\":\"...\",\"D\":\"...\",\"E\":\"...\"},\"dogruCevap\":\"A\",\"aciklama\":\"...\"}",
+      imageBase64,mimeType
+    });
+    const parsed = temizJson(content);
+    if (!parsed?.soru || !parsed?.dogruCevap) throw new Error("Görselden geçerli soru cevabı alınamadı.");
+    res.json(parsed);
+  } catch(err) {
+    console.error("[ai/solve-image]",err.message);
+    res.status(503).json({hata:"Fotoğraftaki soru şu anda çözülemedi. Daha net bir görsel deneyin."});
+  }
+});
 
+router.get("/health", (req,res)=>res.json({ok:true,servis:"KPSS AI",sistem:"OpenRouter",modeller:modelListesi(),maksimumSoru:MAX_TEST,denemeSoru:MOCK_EXAM_SORU}));
 module.exports = router;
