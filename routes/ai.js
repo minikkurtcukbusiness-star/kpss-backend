@@ -6,13 +6,21 @@ const MOCK_EXAM_SORU = 20;
 const TIMEOUT_MS = 110000;
 const MAX_JSON_DENEME = 3;
 
-// openrouter/free her istekte farklı ücretsiz modeli seçebilir. Bazı rotalarda
-// soru yerine moderasyon çıktısı ("User Safety: safe") dönebildiği için soru
-// üretiminde kararlı bir modeli varsayılan yapıyoruz. Railway ENV ile değişebilir.
-const SORU_MODELLERI = [
-  process.env.OPENROUTER_MODEL || "qwen/qwen3-next-80b-a3b-instruct:free",
-  "nvidia/nemotron-3-ultra:free"
+// Sadece OpenRouter'da doğrulanmış model kimlikleri kullanılır.
+// openrouter/free bilerek kullanılmıyor: router her istekte farklı bir ücretsiz model
+// seçebildiği için bazen "User Safety: safe" gibi moderasyon çıktısı döndürebiliyor.
+// Nemotron'un doğru slug'ı da tam sürüm adını içeriyor.
+const VARSAYILAN_SORU_MODELLERI = [
+  "qwen/qwen3-next-80b-a3b-instruct:free",
+  "nvidia/nemotron-3-ultra-550b-a55b:free"
 ];
+
+function modelListesi() {
+  const envModel = String(process.env.OPENROUTER_MODEL || "").trim();
+  const adaylar = envModel ? [envModel, ...VARSAYILAN_SORU_MODELLERI] : VARSAYILAN_SORU_MODELLERI;
+  // Aynı modeli iki kez denemeyi önle; boş/yanlış eski env değerini de filtrele.
+  return [...new Set(adaylar.filter(Boolean))];
+}
 
 function temizJson(metin) {
   if (!metin || typeof metin !== "string") return null;
@@ -24,13 +32,23 @@ function temizJson(metin) {
 
   try { return JSON.parse(temiz); } catch (_) {}
 
-  const baslangic = temiz.indexOf("{");
+  // Model bazen JSON'dan önce/sonra kısa açıklama yazabiliyor.
+  // Hem nesne hem dizi için dengeli biçimde JSON bloğunu bul.
+  const baslangicNesne = temiz.indexOf("{");
+  const baslangicDizi = temiz.indexOf("[");
+  let baslangic = -1;
+  if (baslangicNesne === -1) baslangic = baslangicDizi;
+  else if (baslangicDizi === -1) baslangic = baslangicNesne;
+  else baslangic = Math.min(baslangicNesne, baslangicDizi);
+
   if (baslangic === -1) {
-    console.error("[JSON PARSE] JSON nesnesi bulunamadı.");
+    console.error("[JSON PARSE] JSON nesnesi/dizisi bulunamadı.");
     console.error("[MODEL CEVABI]", temiz.substring(0, 1000));
     return null;
   }
 
+  const acilis = temiz[baslangic];
+  const kapanis = acilis === "{" ? "}" : "]";
   let derinlik = 0, stringIcinde = false, escape = false;
   for (let i = baslangic; i < temiz.length; i++) {
     const karakter = temiz[i];
@@ -38,8 +56,8 @@ function temizJson(metin) {
     if (karakter === "\\" && stringIcinde) { escape = true; continue; }
     if (karakter === '"') { stringIcinde = !stringIcinde; continue; }
     if (stringIcinde) continue;
-    if (karakter === "{") derinlik++;
-    else if (karakter === "}") {
+    if (karakter === acilis) derinlik++;
+    else if (karakter === kapanis) {
       derinlik--;
       if (derinlik === 0) {
         try { return JSON.parse(temiz.substring(baslangic, i + 1)); }
@@ -73,10 +91,10 @@ async function openRouterSoruIste({ apiKey, model, prompt, signal }) {
     body: JSON.stringify({
       model,
       messages: [
-        { role: "system", content: "Sen KPSS Ortaöğretim için kaliteli ve özgün test soruları hazırlayan uzman bir öğretmensin. Yalnızca geçerli JSON nesnesi döndür." },
+        { role: "system", content: "Sen KPSS Ortaöğretim için kaliteli ve özgün test soruları hazırlayan uzman bir öğretmensin. ÇIKTIYI SADECE GEÇERLİ JSON OLARAK VER. JSON dışında tek karakter açıklama yazma." },
         { role: "user", content: prompt }
       ],
-      temperature: 0.15,
+      temperature: 0.1,
       max_tokens: 6000,
       response_format: { type: "json_object" }
     }),
@@ -93,6 +111,35 @@ async function openRouterSoruIste({ apiKey, model, prompt, signal }) {
   const content = data?.choices?.[0]?.message?.content;
   if (!content) throw new Error("OpenRouter bos cevap dondurdu.");
   return content;
+}
+
+function promptOlustur(konular, toplamIstenen, tekrarNo = 0) {
+  const konuMetni = konular.map((k, i) => `${i + 1}. Ders: ${k.subject}\nKonu: ${k.topic}\nZorluk: ${k.difficulty}\nSoru sayısı: ${k.count}`).join("\n\n");
+  const tekrarUyari = tekrarNo > 0
+    ? `\nÖNEMLİ: Önceki üretim geçerli JSON olarak doğrulanamadı. Bu kez JSON sözdizimini özellikle kontrol et. JSON dışında hiçbir şey yazma.\n`
+    : "";
+
+  return `Sen Türkiye'deki KPSS Ortaöğretim sınavına hazırlanan öğrenciler için soru hazırlayan uzman bir KPSS öğretmenisin.
+
+Aşağıdaki ders ve konulara göre TAM OLARAK ${toplamIstenen} adet soru üret.
+${tekrarUyari}
+DERSLER:
+${konuMetni}
+
+KURALLAR:
+1. KPSS Ortaöğretim seviyesinde, özgün ve açık Türkçe kullan.
+2. Her soru 5 seçenekli olsun: A, B, C, D, E.
+3. Yalnızca bir doğru cevap olsun.
+4. dogruCevap yalnızca A, B, C, D veya E olsun.
+5. Mantıklı çeldiriciler kullan.
+6. Bilgi ve hesaplamaları kontrol et.
+7. Her soruya kısa ve öğretici açıklama ekle.
+8. Aynı soruyu veya seçenekleri tekrar etme.
+9. JSON dışında hiçbir açıklama, markdown, kod bloğu veya selamlama yazma.
+10. Tüm metinler geçerli JSON stringleri olmalı; çift tırnakları gerektiğinde escape et.
+
+SADECE şu yapıda geçerli JSON döndür:
+{"sorular":[{"subject":"Türkçe","topic":"Sözcükte Anlam","soru":"Soru metni","secenekler":{"A":"A seçeneği","B":"B seçeneği","C":"C seçeneği","D":"D seçeneği","E":"E seçeneği"},"dogruCevap":"A","aciklama":"Kısa açıklama"}]}`;
 }
 
 async function sorulariUret(istekler) {
@@ -112,40 +159,26 @@ async function sorulariUret(istekler) {
   if (!konular.length) konular.push({ subject: "Türkçe", topic: "Genel", difficulty: "orta", count: MAX_SORU });
 
   const toplamIstenen = Math.min(MAX_SORU, konular.reduce((t, k) => t + k.count, 0));
-  const konuMetni = konular.map((k, i) => `${i + 1}. Ders: ${k.subject}\nKonu: ${k.topic}\nZorluk: ${k.difficulty}\nSoru sayısı: ${k.count}`).join("\n\n");
-  const prompt = `Sen Türkiye'deki KPSS Ortaöğretim sınavına hazırlanan öğrenciler için soru hazırlayan uzman bir KPSS öğretmenisin.
-
-Aşağıdaki ders ve konulara göre TAM OLARAK ${toplamIstenen} adet soru üret.
-
-DERSLER:
-${konuMetni}
-
-KURALLAR:
-1. KPSS Ortaöğretim seviyesinde, özgün ve açık Türkçe kullan.
-2. Her soru 5 seçenekli olsun: A, B, C, D, E.
-3. Yalnızca bir doğru cevap olsun.
-4. dogruCevap yalnızca A, B, C, D veya E olsun.
-5. Mantıklı çeldiriciler kullan.
-6. Bilgi ve hesaplamaları kontrol et.
-7. Her soruya kısa açıklama ekle.
-8. JSON dışında hiçbir açıklama, markdown veya kod bloğu yazma.
-9. Tüm metinler geçerli JSON stringleri olmalı.
-
-SADECE şu yapıda geçerli JSON döndür:
-{"sorular":[{"subject":"Türkçe","topic":"Sözcükte Anlam","soru":"Soru metni","secenekler":{"A":"A seçeneği","B":"B seçeneği","C":"C seçeneği","D":"D seçeneği","E":"E seçeneği"},"dogruCevap":"A","aciklama":"Kısa açıklama"}]}`;
-
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const modeller = modelListesi();
 
   try {
     let sonHata = null;
     for (let deneme = 1; deneme <= MAX_JSON_DENEME; deneme++) {
-      const model = SORU_MODELLERI[(deneme - 1) % SORU_MODELLERI.length];
+      // Model değiştirmek yerine önce aynı kararlı modeli tekrar deniyoruz.
+      // Böylece geçici JSON/sağlayıcı hatasında rastgele bir modele düşmüyoruz.
+      const model = modeller[(deneme - 1) % modeller.length];
       try {
         console.log(`[OpenRouter] ${toplamIstenen} soru isteniyor. Model: ${model}`);
         console.log(`[OpenRouter] JSON üretim denemesi: ${deneme}/${MAX_JSON_DENEME}`);
 
-        const content = await openRouterSoruIste({ apiKey, model, prompt, signal: controller.signal });
+        const content = await openRouterSoruIste({
+          apiKey,
+          model,
+          prompt: promptOlustur(konular, toplamIstenen, deneme - 1),
+          signal: controller.signal
+        });
         console.log(`[OpenRouter] Cevap alindi. Uzunluk: ${content.length}`);
 
         if (/^(User Safety|Safety)\s*:/i.test(content.trim())) {
@@ -153,7 +186,10 @@ SADECE şu yapıda geçerli JSON döndür:
         }
 
         const sonuc = temizJson(content);
-        if (!sonuc) { sonHata = new Error("Yapay zeka gecerli JSON uretmedi."); continue; }
+        if (!sonuc) {
+          sonHata = new Error("Yapay zeka gecerli JSON uretmedi.");
+          continue;
+        }
         const sorular = Array.isArray(sonuc) ? sonuc : (Array.isArray(sonuc.sorular) ? sonuc.sorular : []);
         const gecerliSorular = sorular.filter(soruGecerliMi).slice(0, MAX_SORU).map((soru, index) => ({
           id: `ai-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 7)}`,
@@ -227,6 +263,7 @@ router.post("/generate-mock-exam", async (req, res) => {
     console.log("[ai/generate-mock-exam] 20 soruluk deneme hazırlanıyor; 4 x 5 soru.");
     const tumSorular = [];
     for (let i = 0; i < batchler.length; i++) {
+      console.log(`[ai/generate-mock-exam] Paket ${i + 1}/4 hazırlanıyor.`);
       const batchSorular = await sorulariUret(batchler[i]);
       if (!batchSorular || batchSorular.length < 5) throw new Error(`Deneme ${i + 1}. soru paketi tamamlanamadı.`);
       tumSorular.push(...batchSorular.slice(0, 5));
@@ -240,6 +277,13 @@ router.post("/generate-mock-exam", async (req, res) => {
   }
 });
 
-router.get("/health", (req, res) => res.json({ ok: true, servis: "KPSS AI", sistem: "OpenRouter", maksimumSoru: MAX_SORU, denemeSoru: MOCK_EXAM_SORU }));
+router.get("/health", (req, res) => res.json({
+  ok: true,
+  servis: "KPSS AI",
+  sistem: "OpenRouter",
+  modeller: modelListesi(),
+  maksimumSoru: MAX_SORU,
+  denemeSoru: MOCK_EXAM_SORU
+}));
 
 module.exports = router;
