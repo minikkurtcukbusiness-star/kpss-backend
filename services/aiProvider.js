@@ -46,12 +46,12 @@ async function generate({ system, prompt, jsonMode = false }) {
 
   const response = await fetch(OPENROUTER_URL, {
     method: "POST",
-    headers: {
-      "Authorization": `Bearer ${getApiKey()}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": "https://kpss-backend-production.up.railway.app",
-      "X-Title": "KPSS 2026 Ortaöğretim"
-    },
+   headers: {
+  "Authorization": `Bearer ${getApiKey()}`,
+  "Content-Type": "application/json",
+  "HTTP-Referer": "https://kpss-backend-production.up.railway.app",
+  "X-Title": "KPSS 2026 Ortaogretim"
+},
     body: JSON.stringify(body)
   });
 
