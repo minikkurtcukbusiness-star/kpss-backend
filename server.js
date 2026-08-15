@@ -10,6 +10,7 @@ const aiRoutes = require("./routes/ai");
 const searchRoutes = require("./routes/search");
 const currentAffairsRoutes = require("./routes/currentAffairs");
 const questionsRoutes = require("./routes/questions");
+const progressRoutes = require("./routes/progress");
 const adminRoutes = require("./routes/admin");
 
 const app = express();
@@ -27,6 +28,7 @@ app.use("/api/ai", aiRoutes);
 app.use("/api/search", searchRoutes);
 app.use("/api/current-affairs", currentAffairsRoutes);
 app.use("/api/questions", questionsRoutes);
+app.use("/api/progress", progressRoutes);
 app.use("/api/admin", adminRoutes);
 
 // Bilinmeyen uç
