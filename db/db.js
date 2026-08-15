@@ -1,8 +1,7 @@
 /* ==========================================================================
    db/db.js
    SQLite veritabanı (tek dosya). Küçük/orta ölçek için yeterlidir;
-   büyük kullanıcı sayısına çıkılırsa PostgreSQL'e taşınabilir
-   (better-sqlite3 -> pg değişimi bu dosyada izole tutulmuştur).
+   büyük kullanıcı sayısına çıkılırsa PostgreSQL'e taşınabilir.
    ========================================================================== */
 
 const path = require("path");
@@ -19,7 +18,7 @@ db.exec(`
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   ad TEXT,
-  tip TEXT DEFAULT 'ucretsiz',      -- ucretsiz | premium
+  tip TEXT DEFAULT 'ucretsiz',
   created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -28,12 +27,12 @@ CREATE TABLE IF NOT EXISTS questions (
   subject TEXT,
   topic TEXT,
   question TEXT,
-  options TEXT,                      -- JSON: {A,B,C,D,E}
+  options TEXT,
   correct_answer TEXT,
   explanation TEXT,
   difficulty TEXT,
-  source TEXT,                       -- 'ai' | 'user' | 'current_affairs'
-  created_by TEXT,                   -- user id, ai ise NULL
+  source TEXT,
+  created_by TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -47,11 +46,11 @@ CREATE TABLE IF NOT EXISTS user_questions (
 CREATE TABLE IF NOT EXISTS test_results (
   id TEXT PRIMARY KEY,
   user_id TEXT,
-  test_turu TEXT,                    -- 'guncel' | 'konu' | 'kisisel'
+  test_turu TEXT,
   dogru INTEGER,
   yanlis INTEGER,
   bos INTEGER,
-  detay TEXT,                        -- JSON
+  detay TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -95,7 +94,7 @@ CREATE TABLE IF NOT EXISTS sources (
 CREATE TABLE IF NOT EXISTS ai_requests (
   id TEXT PRIMARY KEY,
   user_id TEXT,
-  gun TEXT,                          -- 'YYYY-MM-DD', günlük limit sayacı için
+  gun TEXT,
   sayi INTEGER DEFAULT 0,
   UNIQUE(user_id, gun)
 );
@@ -103,7 +102,7 @@ CREATE TABLE IF NOT EXISTS ai_requests (
 CREATE TABLE IF NOT EXISTS ai_usage (
   id TEXT PRIMARY KEY,
   user_id TEXT,
-  islem TEXT,                        -- 'teacher' | 'generate-questions' | 'solve-image' | 'current-affairs'
+  islem TEXT,
   saglayici TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
@@ -120,6 +119,21 @@ CREATE TABLE IF NOT EXISTS settings (
   anahtar TEXT PRIMARY KEY,
   deger TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_test_results_user_date
+  ON test_results(user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_wrong_questions_user_date
+  ON wrong_questions(user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_study_sessions_user_date
+  ON study_sessions(user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_questions_subject_topic
+  ON questions(subject, topic);
+
+CREATE INDEX IF NOT EXISTS idx_current_affairs_date
+  ON current_affairs(published_at);
 `);
 
 module.exports = db;
