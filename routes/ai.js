@@ -1,357 +1,115 @@
 /* ==========================================================================
    routes/ai.js
-   - POST /api/ai/teacher
-      → AI Öğretmen (gerekirse web aramasıyla desteklenir)
+   KPSS 2026 - BASİT 20 SORULUK AI SİSTEMİ
 
-   - POST /api/ai/generate-questions
-      → Konu bazlı özgün soru üretimi + kalite kontrolü
-
-   - POST /api/ai/solve-image
-      → Fotoğraftan soru çözme
-
-   - POST /api/ai/generate-mixed-test
-      → VERİTABANINDAN KARMA TEST
-      → AI KULLANMAZ
+   Bu sürüm:
+   - Gemini kullanmaz
+   - Veritabanından soru çekmez
+   - Soru havuzu kullanmaz
+   - Tek OpenRouter isteği gönderir
+   - Maksimum 20 soru üretir
+   - Frontend'e direkt soruları gönderir
    ========================================================================== */
 
 const express = require("express");
-const { nanoid } = require("nanoid");
-const aiProvider = require("../services/aiProvider");
-const { searchWeb } = require("../services/webSearch");
-const { aiRateLimit } = require("../middleware/rateLimit");
-const db = require("../db/db");
 
 const router = express.Router();
 
-/* ==========================================================================
-   SINAV SİSTEM TALİMATI
-   ========================================================================== */
+/* --------------------------------------------------------------------------
+   YARDIMCI: JSON TEMİZLE
+   -------------------------------------------------------------------------- */
 
-const SINAV_SISTEM_TALIMATI = `
-Sen 2026 KPSS Ortaöğretim sınavına hazırlanan bir öğrenciye yardımcı olan,
-uzman bir KPSS öğretmenisin.
+function temizJson(metin) {
+  if (!metin || typeof metin !== "string") {
+    return null;
+  }
 
-- Genel bir sohbet botu gibi davranma.
-- Her zaman KPSS sınavı bağlamında, öz ve anlaşılır cevap ver.
-- Cevaplarını Türkçe ver.
-- Emin olmadığın veya doğrulayamadığın güncel bir bilgi varsa bunu açıkça belirt,
-  uydurma.
-- Sana kaynak metinleri verilmişse cevabını öncelikle bu kaynaklara dayandır.
-`;
+  let temiz = metin.trim();
 
-/* ==========================================================================
-   GÜNCEL BİLGİ GEREKİYOR MU?
-   ========================================================================== */
+  // Markdown kod bloğu varsa kaldır
+  temiz = temiz
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
 
-function guncelBilgiGerekiyorMu(soru) {
+  // İlk { veya [ karakterinden başlat
+  const ilkObje = temiz.indexOf("{");
+  const ilkDizi = temiz.indexOf("[");
 
-  const anahtarKelimeler = [
-    "güncel",
-    "şu an",
-    "şu anda",
-    "kim",
-    "2026",
-    "2025",
-    "bu yıl",
-    "son",
-    "yeni",
-    "değişti",
-    "değişiklik",
-    "atandı",
-    "seçildi",
-    "kazandı"
-  ];
+  let baslangic = -1;
 
-  const kucuk =
-    soru.toLocaleLowerCase("tr");
+  if (ilkObje === -1) {
+    baslangic = ilkDizi;
+  } else if (ilkDizi === -1) {
+    baslangic = ilkObje;
+  } else {
+    baslangic = Math.min(ilkObje, ilkDizi);
+  }
 
-  return anahtarKelimeler.some(
-    k => kucuk.includes(k)
-  );
-}
+  if (baslangic > 0) {
+    temiz = temiz.substring(baslangic);
+  }
 
-/* ==========================================================================
-   AI KULLANIM KAYDI
-   ========================================================================== */
+  // Son JSON karakterinden sonrasını temizle
+  const sonObje = temiz.lastIndexOf("}");
+  const sonDizi = temiz.lastIndexOf("]");
 
-function aiUsageKaydet(userId, islem) {
+  const bitis = Math.max(sonObje, sonDizi);
 
-  db.prepare(
-    "INSERT INTO ai_usage (id, user_id, islem, saglayici) VALUES (?, ?, ?, ?)"
-  ).run(
-    nanoid(),
-    userId || null,
-    islem,
-    process.env.AI_PROVIDER || "gemini"
-  );
-}
-
-/* ==========================================================================
-   GÜVENLİ JSON AYRIŞTIRICI
-   ========================================================================== */
-
-function guvenliJsonAyristir(metin) {
+  if (bitis !== -1 && bitis < temiz.length - 1) {
+    temiz = temiz.substring(0, bitis + 1);
+  }
 
   try {
-
-    const temiz =
-      metin
-        .replace(/```json|```/g, "")
-        .trim();
-
     return JSON.parse(temiz);
-
-  } catch {
+  } catch (e) {
+    console.error("[JSON PARSE HATASI]", e.message);
+    console.error("[MODEL CEVABI]", temiz.substring(0, 2000));
 
     return null;
   }
 }
 
-/* ==========================================================================
-   AI ÖĞRETMEN
-   ========================================================================== */
+/* --------------------------------------------------------------------------
+   SORU KONTROLÜ
+   -------------------------------------------------------------------------- */
 
-router.post(
-  "/teacher",
-  aiRateLimit,
-  async (req, res) => {
+function soruGecerliMi(soru) {
+  if (!soru || typeof soru !== "object") {
+    return false;
+  }
 
-    const { soru } = req.body;
-    const userId =
-      req.header("X-User-Id");
+  if (
+    !soru.soru ||
+    typeof soru.soru !== "string" ||
+    soru.soru.trim().length < 5
+  ) {
+    return false;
+  }
 
+  if (
+    !soru.secenekler ||
+    typeof soru.secenekler !== "object"
+  ) {
+    return false;
+  }
+
+  const harfler = ["A", "B", "C", "D", "E"];
+
+  for (const harf of harfler) {
     if (
-      !soru ||
-      !soru.trim()
+      !soru.secenekler[harf] ||
+      typeof soru.secenekler[harf] !== "string"
     ) {
-
-      return res.status(400).json({
-        hata: "Soru boş olamaz."
-      });
-    }
-
-    try {
-
-      let kaynaklar = [];
-      let kaynakMetni = "";
-
-      /*
-       * Güncel bilgi gerekiyorsa web araması yap.
-       */
-
-      if (
-        guncelBilgiGerekiyorMu(soru)
-      ) {
-
-        kaynaklar =
-          await searchWeb(
-            soru,
-            {
-              onlyTrusted: true,
-              limit: 5
-            }
-          );
-
-        if (
-          kaynaklar.length > 0
-        ) {
-
-          kaynakMetni =
-            "\n\nAşağıdaki güncel kaynakları dikkate alarak cevap ver:\n" +
-            kaynaklar
-              .map(
-                (k, i) =>
-                  `[${i + 1}] ${k.baslik} (${k.kaynak}) — ${k.icerikOzeti}`
-              )
-              .join("\n");
-        }
-      }
-
-      const cevapMetni =
-        await aiProvider.generate({
-
-          system:
-            SINAV_SISTEM_TALIMATI,
-
-          prompt:
-            `Öğrenci sorusu: "${soru}"` +
-            kaynakMetni +
-            `
-
-Kısa, anlaşılır ve KPSS odaklı cevap ver.
-
-Uygunsa şu başlıkları kullan:
-
-📌 KPSS'de önemli
-⚠ Karıştırma
-🧠 Ezberle
-`
-        });
-
-      aiUsageKaydet(
-        userId,
-        "teacher"
-      );
-
-      res.json({
-
-        cevap:
-          cevapMetni,
-
-        kaynaklar:
-          kaynaklar.map(k => ({
-            baslik: k.baslik,
-            url: k.url,
-            kaynak: k.kaynak,
-            tarih: k.tarih
-          })),
-
-        belirsiz:
-          kaynaklar.length === 0 &&
-          guncelBilgiGerekiyorMu(soru)
-      });
-
-    } catch (err) {
-
-      console.error(
-        "[ai/teacher]",
-        err.message
-      );
-
-      res.status(503).json({
-
-        hata:
-          "Yapay zekâ servisine şu anda ulaşılamıyor. Lütfen tekrar deneyin."
-
-      });
+      return false;
     }
   }
-);
-
-/* ==========================================================================
-   AI SORU ÜRETME
-   ========================================================================== */
-
-async function soruUret({
-  subject,
-  topic,
-  difficulty,
-  count
-}) {
-
-  const prompt = `
-KPSS Ortaöğretim seviyesinde,
-"${subject}" dersinin "${topic}" konusunda,
-"${difficulty}" zorlukta,
-TAMAMEN ÖZGÜN ${count} adet çoktan seçmeli soru üret.
-
-Kurallar:
-
-- Her sorunun tek bir doğru cevabı olmalı.
-- Çeldiriciler mantıklı ve konuyla ilgili olmalı.
-- Telif hakkı olan yayınlardan doğrudan kopya yapma.
-- Kendi cümlelerinle özgün soru yaz.
-- Yalnızca aşağıdaki JSON formatında cevap ver.
-- Başka hiçbir açıklama ekleme.
-
-[
-  {
-    "soru": "...",
-    "secenekler": {
-      "A": "...",
-      "B": "...",
-      "C": "...",
-      "D": "...",
-      "E": "..."
-    },
-    "dogruCevap": "A",
-    "aciklama": "..."
-  }
-]
-`;
-
-  const metin =
-    await aiProvider.generate({
-
-      system:
-        "Sen özgün KPSS soruları hazırlayan bir soru yazarısın. Yalnızca istenen JSON formatında cevap ver.",
-
-      prompt,
-
-      jsonMode: true
-    });
-
-  const sorular =
-    guvenliJsonAyristir(metin);
-
-  return Array.isArray(sorular)
-    ? sorular
-    : [];
-}
-
-/* ==========================================================================
-   SORU KALİTE KONTROLÜ
-   ========================================================================== */
-
-function soruGecerliMi(s) {
 
   if (
-    !s ||
-    typeof s !== "object"
-  ) {
-    return false;
-  }
-
-  if (
-    !s.soru ||
-    typeof s.soru !== "string" ||
-    s.soru.length < 8
-  ) {
-    return false;
-  }
-
-  if (
-    !s.secenekler ||
-    typeof s.secenekler !== "object"
-  ) {
-    return false;
-  }
-
-  const anahtarlar =
-    Object.keys(
-      s.secenekler
-    );
-
-  if (
-    !["A", "B", "C", "D", "E"]
-      .every(
-        h => anahtarlar.includes(h)
-      )
-  ) {
-    return false;
-  }
-
-  if (
-    !s.dogruCevap ||
-    !["A", "B", "C", "D", "E"]
-      .includes(s.dogruCevap)
-  ) {
-    return false;
-  }
-
-  const degerler =
-    Object.values(
-      s.secenekler
+    !harfler.includes(
+      String(soru.dogruCevap || "").toUpperCase()
     )
-      .map(v =>
-        String(v)
-          .trim()
-          .toLowerCase()
-      );
-
-  if (
-    new Set(degerler).size !==
-    degerler.length
   ) {
     return false;
   }
@@ -359,843 +117,448 @@ function soruGecerliMi(s) {
   return true;
 }
 
-/* ==========================================================================
-   KONU BAZLI SORU ÜRETME
-   ========================================================================== */
+/* --------------------------------------------------------------------------
+   OPENROUTER'DAN 20 SORU ÜRET
+   -------------------------------------------------------------------------- */
 
-router.post(
-  "/generate-questions",
-  aiRateLimit,
-  async (req, res) => {
+async function sorulariUret(istekler) {
 
-    const {
-      subject,
-      topic,
-      difficulty = "orta",
-      count = 5
-    } = req.body;
+  const apiKey = process.env.OPENROUTER_API_KEY;
 
-    const userId =
-      req.header("X-User-Id");
-
-    if (
-      !subject ||
-      !topic
-    ) {
-
-      return res.status(400).json({
-        hata:
-          "Ders ve konu zorunludur."
-      });
-    }
-
-    const guvenliSayi =
-      Math.max(
-        1,
-        Math.min(
-          Number(count) || 5,
-          20
-        )
-      );
-
-    try {
-
-      /*
-       * AI ile soru üret.
-       */
-
-      let sorular =
-        await soruUret({
-          subject,
-          topic,
-          difficulty,
-          count:
-            guvenliSayi
-        });
-
-      /*
-       * Kalite kontrolü.
-       */
-
-      let gecerliSorular =
-        sorular.filter(
-          soruGecerliMi
-        );
-
-      /*
-       * Eksik varsa bir kez daha üret.
-       */
-
-      if (
-        gecerliSorular.length <
-        guvenliSayi
-      ) {
-
-        const eksik =
-          guvenliSayi -
-          gecerliSorular.length;
-
-        const ekSorular =
-          await soruUret({
-            subject,
-            topic,
-            difficulty,
-            count: eksik
-          });
-
-        gecerliSorular =
-          gecerliSorular.concat(
-            ekSorular.filter(
-              soruGecerliMi
-            )
-          );
-      }
-
-      /*
-       * Veritabanına kaydet.
-       */
-
-      const kaydedilenler =
-        gecerliSorular
-          .slice(
-            0,
-            guvenliSayi
-          )
-          .map(s => {
-
-            const id =
-              nanoid();
-
-            db.prepare(`
-              INSERT INTO questions
-              (
-                id,
-                subject,
-                topic,
-                question,
-                options,
-                correct_answer,
-                explanation,
-                difficulty,
-                source,
-                created_by
-              )
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ai', NULL)
-            `).run(
-
-              id,
-
-              subject,
-
-              topic,
-
-              s.soru,
-
-              JSON.stringify(
-                s.secenekler
-              ),
-
-              s.dogruCevap,
-
-              s.aciklama || "",
-
-              difficulty
-            );
-
-            return {
-
-              id,
-
-              soru:
-                s.soru,
-
-              secenekler:
-                s.secenekler,
-
-              dogruCevap:
-                s.dogruCevap,
-
-              aciklama:
-                s.aciklama || ""
-            };
-          });
-
-      aiUsageKaydet(
-        userId,
-        "generate-questions"
-      );
-
-      res.json({
-        sorular:
-          kaydedilenler
-      });
-
-    } catch (err) {
-
-      console.error(
-        "[ai/generate-questions]",
-        err.message
-      );
-
-      res.status(503).json({
-
-        hata:
-          "Yapay zekâ servisine şu anda ulaşılamıyor. Lütfen tekrar deneyin."
-
-      });
-    }
+  if (!apiKey) {
+    throw new Error(
+      "OPENROUTER_API_KEY Railway Variables bölümünde bulunamadı."
+    );
   }
-);
 
-/* ==========================================================================
-   FOTOĞRAFTAN SORU ÇÖZ
-   ========================================================================== */
+  /*
+     Frontend'den gelen ders/konu listesini güvenli şekilde 20 soruya sınırla.
+  */
 
-router.post(
-  "/solve-image",
-  aiRateLimit,
-  async (req, res) => {
+  let kalan = 20;
 
-    const {
-      imageBase64,
-      mimeType
-    } = req.body;
+  const konular = [];
 
-    const userId =
-      req.header("X-User-Id");
+  for (const istek of istekler) {
 
-    if (!imageBase64) {
-
-      return res.status(400).json({
-        hata:
-          "Görsel gönderilmedi."
-      });
+    if (!istek || !istek.subject) {
+      continue;
     }
 
-    try {
+    if (kalan <= 0) {
+      break;
+    }
 
-      const metin =
-        await aiProvider.generateWithImage({
+    const konu = istek.topic || "Genel";
 
-          system:
-            "Sen bir KPSS öğretmenisin. Sana bir soru fotoğrafı verilecek.",
+    let sayi = Number(istek.count);
 
-          prompt: `
-Bu görseldeki çoktan seçmeli soruyu ve şıklarını oku ve çöz.
+    if (!Number.isFinite(sayi) || sayi <= 0) {
+      sayi = 1;
+    }
 
-Yalnızca şu JSON formatında cevap ver:
+    sayi = Math.floor(sayi);
+
+    if (sayi > kalan) {
+      sayi = kalan;
+    }
+
+    konular.push({
+      subject: String(istek.subject),
+      topic: String(konu),
+      difficulty: String(istek.difficulty || "orta"),
+      count: sayi
+    });
+
+    kalan -= sayi;
+  }
+
+  /*
+     Frontend 80 istese bile maksimum 20.
+     Eğer frontend yanlışlıkla sayı göndermezse yine 20'ye tamamla.
+  */
+
+  if (konular.length === 0) {
+    konular.push({
+      subject: "Türkçe",
+      topic: "Genel Türkçe",
+      difficulty: "orta",
+      count: 20
+    });
+  }
+
+  const toplamIstenen = konular.reduce(
+    (toplam, konu) => toplam + konu.count,
+    0
+  );
+
+  const konuMetni = konular
+    .map(
+      (k, index) =>
+        `${index + 1}. Ders: ${k.subject} | Konu: ${k.topic} | Zorluk: ${k.difficulty} | Soru: ${k.count}`
+    )
+    .join("\n");
+
+  /* ----------------------------------------------------------------------
+     PROMPT
+     ---------------------------------------------------------------------- */
+
+  const prompt = `
+Sen Türkiye'deki 2026 KPSS Ortaöğretim sınavına hazırlanan öğrenci için
+çok kaliteli test soruları hazırlayan uzman bir KPSS öğretmenisin.
+
+Aşağıdaki ders ve konulara göre TAM OLARAK ${toplamIstenen} adet soru üret.
+
+DERS VE KONU DAĞILIMI:
+
+${konuMetni}
+
+KURALLAR:
+
+1. Sorular KPSS Ortaöğretim seviyesinde olsun.
+
+2. Her soru 5 seçenekli olsun:
+A, B, C, D, E.
+
+3. Her soruda yalnızca BİR doğru cevap olsun.
+
+4. Doğru cevap "A", "B", "C", "D" veya "E" şeklinde yazılmalı.
+
+5. Sorular özgün olsun.
+
+6. Sorular açık ve anlaşılır Türkçe ile yazılsın.
+
+7. Şıklar mantıklı çeldiriciler içersin.
+
+8. Aynı soruyu veya çok benzer soruları tekrar etme.
+
+9. Tarih, vatandaşlık ve coğrafya sorularında bilgi hatası yapma.
+
+10. Matematik sorularında hesaplamaları kontrol et.
+
+11. Her sorunun kısa ve öğretici bir açıklaması olsun.
+
+12. Güncel bilgi gerektiren bir soru oluşturuyorsan kesin olmayan bilgileri
+uydurma.
+
+13. Kullanıcıya soru dışında hiçbir açıklama yazma.
+
+14. SADECE JSON döndür.
+
+ÇOK ÖNEMLİ:
+
+Cevabın aşağıdaki JSON formatında olmalı:
 
 {
-  "soru": "...",
-  "secenekler": {
-    "A": "...",
-    "B": "...",
-    "C": "...",
-    "D": "...",
-    "E": "..."
-  },
-  "dogruCevap": "A",
-  "aciklama": "..."
+  "sorular": [
+    {
+      "subject": "Türkçe",
+      "topic": "Sözcükte Anlam",
+      "soru": "Soru metni",
+      "secenekler": {
+        "A": "A seçeneği",
+        "B": "B seçeneği",
+        "C": "C seçeneği",
+        "D": "D seçeneği",
+        "E": "E seçeneği"
+      },
+      "dogruCevap": "A",
+      "aciklama": "Doğru cevabın kısa açıklaması"
+    }
+  ]
 }
 
-Görsel okunamıyorsa veya soru net değilse:
+SADECE JSON.
+Markdown kullanma.
+\`\`\` kullanma.
+JSON dışında hiçbir şey yazma.
+`;
 
-{
-  "hata": "Görseldeki soru okunamıyor."
-}
-`,
+  /* ----------------------------------------------------------------------
+     OPENROUTER İSTEĞİ
+     ---------------------------------------------------------------------- */
 
-          imageBase64,
+  const controller = new AbortController();
 
-          mimeType:
-            mimeType ||
-            "image/jpeg"
-        });
+  /*
+     110 saniye timeout.
+     Tek AI isteği olduğu için önceki sisteme göre çok daha az riskli.
+  */
 
-      const sonuc =
-        guvenliJsonAyristir(
-          metin
-        );
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, 110000);
 
-      if (!sonuc) {
+  try {
 
-        return res.status(422).json({
+    const model =
+      process.env.OPENROUTER_MODEL ||
+      "openrouter/free";
 
-          hata:
-            "Görseldeki soru anlaşılamadı, lütfen daha net bir fotoğraf deneyin."
+    console.log(
+      `[OpenRouter] ${toplamIstenen} soru isteniyor. Model: ${model}`
+    );
 
-        });
+    const response = await fetch(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        method: "POST",
+
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+
+          "HTTP-Referer":
+            process.env.APP_URL ||
+            "https://kpss-backend-production.up.railway.app",
+
+          "X-Title": "KPSS 2026 Ortaöğretim"
+        },
+
+        body: JSON.stringify({
+          model: model,
+
+          messages: [
+            {
+              role: "system",
+              content:
+                "Sen KPSS Ortaöğretim için kaliteli, özgün ve doğru test soruları hazırlayan uzman bir öğretmensin. Yalnızca istenen JSON formatında cevap ver."
+            },
+            {
+              role: "user",
+              content: prompt
+            }
+          ],
+
+          temperature: 0.4,
+
+          /*
+             20 soru için yeterli alan.
+          */
+          max_tokens: 10000
+        }),
+
+        signal: controller.signal
       }
+    );
 
-      if (sonuc.hata) {
+    const responseText = await response.text();
 
-        return res.status(422).json({
-          hata:
-            sonuc.hata
-        });
-      }
-
-      aiUsageKaydet(
-        userId,
-        "solve-image"
-      );
-
-      res.json(sonuc);
-
-    } catch (err) {
+    if (!response.ok) {
 
       console.error(
-        "[ai/solve-image]",
-        err.message
+        "[OpenRouter API HATASI]",
+        response.status,
+        responseText
       );
 
-      res.status(503).json({
-
-        hata:
-          "Yapay zekâ servisine şu anda ulaşılamıyor. Lütfen tekrar deneyin."
-
-      });
+      throw new Error(
+        `OpenRouter API ${response.status}: ${responseText}`
+      );
     }
+
+    let data;
+
+    try {
+      data = JSON.parse(responseText);
+    } catch (e) {
+      throw new Error(
+        "OpenRouter cevabı JSON olarak okunamadı."
+      );
+    }
+
+    const content =
+      data &&
+      data.choices &&
+      data.choices[0] &&
+      data.choices[0].message &&
+      data.choices[0].message.content;
+
+    if (!content) {
+      console.error(
+        "[OpenRouter BOŞ CEVAP]",
+        JSON.stringify(data).substring(0, 3000)
+      );
+
+      throw new Error(
+        "OpenRouter boş cevap döndürdü."
+      );
+    }
+
+    console.log(
+      `[OpenRouter] Cevap alındı. Uzunluk: ${content.length}`
+    );
+
+    const sonuc = temizJson(content);
+
+    if (!sonuc) {
+      throw new Error(
+        "Yapay zekâ geçerli JSON üretmedi."
+      );
+    }
+
+    let sorular = [];
+
+    if (Array.isArray(sonuc)) {
+      sorular = sonuc;
+    } else if (Array.isArray(sonuc.sorular)) {
+      sorular = sonuc.sorular;
+    }
+
+    const gecerliSorular = sorular
+      .filter(soruGecerliMi)
+      .slice(0, 20)
+      .map((soru, index) => ({
+        id:
+          `ai-${Date.now()}-${index}`,
+
+        subject:
+          soru.subject || "KPSS",
+
+        topic:
+          soru.topic || "Genel",
+
+        soru:
+          soru.soru.trim(),
+
+        secenekler: {
+          A: String(soru.secenekler.A),
+          B: String(soru.secenekler.B),
+          C: String(soru.secenekler.C),
+          D: String(soru.secenekler.D),
+          E: String(soru.secenekler.E)
+        },
+
+        dogruCevap:
+          String(soru.dogruCevap).toUpperCase(),
+
+        aciklama:
+          String(soru.aciklama || "")
+      }));
+
+    if (gecerliSorular.length === 0) {
+      throw new Error(
+        "Yapay zekâdan geçerli soru alınamadı."
+      );
+    }
+
+    console.log(
+      `[OpenRouter] ${gecerliSorular.length} geçerli soru hazır.`
+    );
+
+    return gecerliSorular;
+
+  } finally {
+
+    clearTimeout(timeout);
+
   }
-);
+}
 
 /* ==========================================================================
    KARMA TEST
-   ==========================================================================
-   
-   ÖNEMLİ:
-   
-   BU BÖLÜM ARTIK AI KULLANMIYOR.
 
-   Kullanıcı 80 soruluk test istediğinde:
+   Frontend:
+   POST /api/ai/generate-mixed-test
 
-   Frontend
-       ↓
-   Railway Backend
-       ↓
-   SQLite questions tablosu
-       ↓
-   Rastgele sorular
-       ↓
-   Frontend
+   Body:
+   {
+     "istekler": [
+       {
+         "subject": "Türkçe",
+         "topic": "Sözcükte Anlam",
+         "difficulty": "orta",
+         "count": 4
+       }
+     ]
+   }
 
-   OpenRouter'a istek gönderilmez.
-   AI kotası kullanılmaz.
-   Timeout riski çok büyük ölçüde azalır.
+   Toplam soru sayısı HER ZAMAN maksimum 20.
    ========================================================================== */
 
-router.post(
-  "/generate-mixed-test",
-  aiRateLimit,
-  async (req, res) => {
+router.post("/generate-mixed-test", async (req, res) => {
 
-    const {
-      istekler
-    } = req.body;
+  try {
+
+    const { istekler } = req.body || {};
 
     if (
       !Array.isArray(istekler) ||
       istekler.length === 0
     ) {
-
       return res.status(400).json({
-
-        hata:
-          "istekler dizisi zorunludur."
-
+        hata: "Ders ve konu bilgisi gönderilmedi."
       });
     }
 
-    try {
+    console.log(
+      "[ai/generate-mixed-test] Test hazırlanıyor..."
+    );
 
-      const tumSorular = [];
+    const sorular =
+      await sorulariUret(istekler);
 
-      const kullanilanIdler =
-        new Set();
+    if (!sorular || sorular.length === 0) {
 
-      /*
-       * İstenen ders/konu/soru sayılarını işle.
-       */
-
-      for (
-        const istek of istekler
-      ) {
-
-        const {
-          subject,
-          topic,
-          difficulty = "orta"
-        } = istek;
-
-        if (
-          !subject ||
-          !topic
-        ) {
-          continue;
-        }
-
-        const istenenSayi =
-          Math.max(
-            1,
-            Math.min(
-              Number(
-                istek.count
-              ) || 5,
-              80
-            )
-          );
-
-        let adaylar = [];
-
-        /* ==========================================================
-           1. AŞAMA
-           Ders + Konu + Zorluk
-           ========================================================== */
-
-        try {
-
-          adaylar =
-            db.prepare(`
-              SELECT
-                id,
-                subject,
-                topic,
-                question,
-                options,
-                correct_answer,
-                explanation,
-                difficulty
-              FROM questions
-              WHERE subject = ?
-                AND topic = ?
-                AND difficulty = ?
-              ORDER BY RANDOM()
-              LIMIT ?
-            `).all(
-
-              subject,
-              topic,
-              difficulty,
-              istenenSayi
-            );
-
-        } catch (err) {
-
-          console.error(
-            "[mixed-test] DB ilk sorgu hatası:",
-            err.message
-          );
-        }
-
-        /* ==========================================================
-           2. AŞAMA
-           Aynı ders + aynı konu
-           Zorluk fark etmez.
-           ========================================================== */
-
-        if (
-          adaylar.length <
-          istenenSayi
-        ) {
-
-          const eksik =
-            istenenSayi -
-            adaylar.length;
-
-          const mevcutIdler =
-            adaylar.map(
-              s => s.id
-            );
-
-          let sorgu = `
-            SELECT
-              id,
-              subject,
-              topic,
-              question,
-              options,
-              correct_answer,
-              explanation,
-              difficulty
-            FROM questions
-            WHERE subject = ?
-              AND topic = ?
-          `;
-
-          const parametreler = [
-            subject,
-            topic
-          ];
-
-          if (
-            mevcutIdler.length > 0
-          ) {
-
-            sorgu += `
-              AND id NOT IN (
-                ${mevcutIdler
-                  .map(() => "?")
-                  .join(",")}
-              )
-            `;
-
-            parametreler.push(
-              ...mevcutIdler
-            );
-          }
-
-          sorgu += `
-            ORDER BY RANDOM()
-            LIMIT ?
-          `;
-
-          parametreler.push(
-            eksik
-          );
-
-          try {
-
-            const ekSorular =
-              db.prepare(
-                sorgu
-              ).all(
-                ...parametreler
-              );
-
-            adaylar =
-              adaylar.concat(
-                ekSorular
-              );
-
-          } catch (err) {
-
-            console.error(
-              "[mixed-test] DB ikinci sorgu hatası:",
-              err.message
-            );
-          }
-        }
-
-        /* ==========================================================
-           3. AŞAMA
-           Aynı dersten farklı konulardan tamamla.
-           ========================================================== */
-
-        if (
-          adaylar.length <
-          istenenSayi
-        ) {
-
-          const eksik =
-            istenenSayi -
-            adaylar.length;
-
-          const mevcutIdler =
-            adaylar.map(
-              s => s.id
-            );
-
-          let sorgu = `
-            SELECT
-              id,
-              subject,
-              topic,
-              question,
-              options,
-              correct_answer,
-              explanation,
-              difficulty
-            FROM questions
-            WHERE subject = ?
-          `;
-
-          const parametreler = [
-            subject
-          ];
-
-          if (
-            mevcutIdler.length > 0
-          ) {
-
-            sorgu += `
-              AND id NOT IN (
-                ${mevcutIdler
-                  .map(() => "?")
-                  .join(",")}
-              )
-            `;
-
-            parametreler.push(
-              ...mevcutIdler
-            );
-          }
-
-          sorgu += `
-            ORDER BY RANDOM()
-            LIMIT ?
-          `;
-
-          parametreler.push(
-            eksik
-          );
-
-          try {
-
-            const ekSorular =
-              db.prepare(
-                sorgu
-              ).all(
-                ...parametreler
-              );
-
-            adaylar =
-              adaylar.concat(
-                ekSorular
-              );
-
-          } catch (err) {
-
-            console.error(
-              "[mixed-test] DB üçüncü sorgu hatası:",
-              err.message
-            );
-          }
-        }
-
-        /* ==========================================================
-           SORULARI SONUCA EKLE
-           ========================================================== */
-
-        for (
-          const soru of adaylar
-        ) {
-
-          /*
-           * Aynı soru başka bir dersten/konudan
-           * gelmişse tekrar ekleme.
-           */
-
-          const soruId =
-            String(
-              soru.id
-            );
-
-          if (
-            kullanilanIdler.has(
-              soruId
-            )
-          ) {
-            continue;
-          }
-
-          kullanilanIdler.add(
-            soruId
-          );
-
-          /* ========================================================
-             OPTIONS JSON
-             ======================================================== */
-
-          let secenekler =
-            soru.options;
-
-          try {
-
-            if (
-              typeof secenekler ===
-              "string"
-            ) {
-
-              secenekler =
-                JSON.parse(
-                  secenekler
-                );
-            }
-
-          } catch (err) {
-
-            console.error(
-              "[mixed-test] Options JSON hatası:",
-              soru.id
-            );
-
-            continue;
-          }
-
-          /*
-           * Şıklar obje değilse soruyu atla.
-           */
-
-          if (
-            !secenekler ||
-            typeof secenekler !==
-              "object"
-          ) {
-
-            continue;
-          }
-
-          /* ========================================================
-             FRONTEND FORMATINA ÇEVİR
-             ======================================================== */
-
-          tumSorular.push({
-
-            id:
-              soru.id,
-
-            subject:
-              soru.subject,
-
-            topic:
-              soru.topic,
-
-            soru:
-              soru.question,
-
-            secenekler:
-              secenekler,
-
-            dogruCevap:
-              soru.correct_answer,
-
-            aciklama:
-              soru.explanation ||
-              "",
-
-            difficulty:
-              soru.difficulty
-          });
-        }
-      }
-
-      /* ============================================================
-         HİÇ SORU YOKSA
-         ============================================================ */
-
-      if (
-        tumSorular.length === 0
-      ) {
-
-        return res.status(404).json({
-
-          hata:
-            "Veritabanında henüz soru bulunamadı. Önce soru havuzunu oluşturmalısın."
-
-        });
-      }
-
-      /* ============================================================
-         TOPLAM İSTENEN SORU SAYISI
-         ============================================================ */
-
-      const toplamIstenen =
-        istekler.reduce(
-          (
-            toplam,
-            istek
-          ) => {
-
-            return (
-              toplam +
-              Math.max(
-                1,
-                Math.min(
-                  Number(
-                    istek.count
-                  ) || 5,
-                  80
-                )
-              )
-            );
-
-          },
-          0
-        );
-
-      /* ============================================================
-         SORULARI KARIŞTIR
-         ============================================================ */
-
-      for (
-        let i =
-          tumSorular.length - 1;
-        i > 0;
-        i--
-      ) {
-
-        const j =
-          Math.floor(
-            Math.random() *
-            (i + 1)
-          );
-
-        [
-          tumSorular[i],
-          tumSorular[j]
-        ] = [
-          tumSorular[j],
-          tumSorular[i]
-        ];
-      }
-
-      /* ============================================================
-         İSTENEN SAYI KADAR SORU GÖNDER
-         ============================================================ */
-
-      const sonuc =
-        tumSorular.slice(
-          0,
-          Math.min(
-            toplamIstenen,
-            tumSorular.length
-          )
-        );
-
-      console.log(
-        `[generate-mixed-test] DB'den ${sonuc.length} soru getirildi. AI kullanılmadı.`
-      );
-
-      /*
-       * DİKKAT:
-       *
-       * Burada aiUsageKaydet() YOK.
-       *
-       * Çünkü bu işlem OpenRouter kullanmıyor.
-       */
-
-      res.json({
-
-        sorular:
-          sonuc,
-
-        toplam:
-          sonuc.length,
-
-        aiKullanildi:
-          false
-
+      return res.status(503).json({
+        hata:
+          "Yapay zekâ soru oluşturamadı. Lütfen tekrar deneyin."
       });
+    }
 
-    } catch (err) {
+    console.log(
+      `[ai/generate-mixed-test] ${sorular.length} soru başarıyla hazırlandı.`
+    );
+
+    return res.json({
+      ok: true,
+      sorular: sorular
+    });
+
+  } catch (err) {
+
+    if (err.name === "AbortError") {
 
       console.error(
-        "[ai/generate-mixed-test]",
-        err.message
+        "[ai/generate-mixed-test] İstek zaman aşımına uğradı."
       );
 
-      res.status(500).json({
-
+      return res.status(504).json({
         hata:
-          "Sorular veritabanından alınırken bir hata oluştu."
-
+          "Soru oluşturma işlemi zaman aşımına uğradı. Lütfen tekrar deneyin."
       });
     }
+
+    console.error(
+      "[ai/generate-mixed-test]",
+      err.message
+    );
+
+    return res.status(503).json({
+      hata:
+        "Yapay zekâ servisine ulaşılamadı. Lütfen birkaç dakika sonra tekrar deneyin."
+    });
   }
-);
+
+});
 
 /* ==========================================================================
-   ROUTER
+   TEST
    ========================================================================== */
+
+router.get("/health", (req, res) => {
+
+  res.json({
+    ok: true,
+    servis: "KPSS AI",
+    sistem: "OpenRouter",
+    maksimumSoru: 20
+  });
+
+});
+
+/* --------------------------------------------------------------------------
+   EXPORT
+   -------------------------------------------------------------------------- */
 
 module.exports = router;
