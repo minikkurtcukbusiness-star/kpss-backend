@@ -312,7 +312,7 @@ JSON dışında hiçbir şey yazma.
             process.env.APP_URL ||
             "https://kpss-backend-production.up.railway.app",
 
-          "X-Title": "KPSS 2026 Ortaöğretim"
+          "X-Title": "KPSS-2026"
         },
 
         body: JSON.stringify({
