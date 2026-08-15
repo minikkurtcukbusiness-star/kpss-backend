@@ -1,6 +1,17 @@
 /* ==========================================================================
    routes/ai.js
-   KPSS 2026 Ortaogretim - AI islemleri
+   - POST /api/ai/teacher
+      → AI Öğretmen (gerekirse web aramasıyla desteklenir)
+
+   - POST /api/ai/generate-questions
+      → Konu bazlı özgün soru üretimi + kalite kontrolü
+
+   - POST /api/ai/solve-image
+      → Fotoğraftan soru çözme
+
+   - POST /api/ai/generate-mixed-test
+      → VERİTABANINDAN KARMA TEST
+      → AI KULLANMAZ
    ========================================================================== */
 
 const express = require("express");
@@ -13,45 +24,49 @@ const db = require("../db/db");
 const router = express.Router();
 
 /* ==========================================================================
-   KPSS SISTEM TALIMATI
+   SINAV SİSTEM TALİMATI
    ========================================================================== */
 
 const SINAV_SISTEM_TALIMATI = `
-Sen 2026 KPSS Ortaogretim sinavina hazirlanan bir ogrenciye yardimci olan,
-uzman bir KPSS ogretmenisin.
+Sen 2026 KPSS Ortaöğretim sınavına hazırlanan bir öğrenciye yardımcı olan,
+uzman bir KPSS öğretmenisin.
 
-- Her zaman KPSS sinavi baglaminda cevap ver.
-- Cevaplarini Turkce ver.
-- Emin olmadigin guncel bilgileri uydurma.
-- Sana kaynak metinleri verilirse oncelikle bu kaynaklara dayan.
+- Genel bir sohbet botu gibi davranma.
+- Her zaman KPSS sınavı bağlamında, öz ve anlaşılır cevap ver.
+- Cevaplarını Türkçe ver.
+- Emin olmadığın veya doğrulayamadığın güncel bir bilgi varsa bunu açıkça belirt,
+  uydurma.
+- Sana kaynak metinleri verilmişse cevabını öncelikle bu kaynaklara dayandır.
 `;
 
 /* ==========================================================================
-   GUNCEL BILGI KONTROLU
+   GÜNCEL BİLGİ GEREKİYOR MU?
    ========================================================================== */
 
 function guncelBilgiGerekiyorMu(soru) {
+
   const anahtarKelimeler = [
-    "guncel",
-    "su an",
-    "su anda",
+    "güncel",
+    "şu an",
+    "şu anda",
     "kim",
     "2026",
     "2025",
-    "bu yil",
+    "bu yıl",
     "son",
     "yeni",
-    "degisti",
-    "degisiklik",
-    "atandi",
-    "secildi",
-    "kazandi"
+    "değişti",
+    "değişiklik",
+    "atandı",
+    "seçildi",
+    "kazandı"
   ];
 
-  const kucuk = soru.toLocaleLowerCase("tr");
+  const kucuk =
+    soru.toLocaleLowerCase("tr");
 
-  return anahtarKelimeler.some(k =>
-    kucuk.includes(k)
+  return anahtarKelimeler.some(
+    k => kucuk.includes(k)
   );
 }
 
@@ -60,142 +75,161 @@ function guncelBilgiGerekiyorMu(soru) {
    ========================================================================== */
 
 function aiUsageKaydet(userId, islem) {
+
   db.prepare(
     "INSERT INTO ai_usage (id, user_id, islem, saglayici) VALUES (?, ?, ?, ?)"
   ).run(
     nanoid(),
     userId || null,
     islem,
-    process.env.AI_PROVIDER || "openrouter"
+    process.env.AI_PROVIDER || "gemini"
   );
 }
 
 /* ==========================================================================
-   GUVENLI JSON AYRISTIRICI
+   GÜVENLİ JSON AYRIŞTIRICI
    ========================================================================== */
 
 function guvenliJsonAyristir(metin) {
-  try {
-    if (!metin || typeof metin !== "string") {
-      return null;
-    }
 
-    const temiz = metin
-      .replace(/```json/gi, "")
-      .replace(/```/g, "")
-      .trim();
+  try {
+
+    const temiz =
+      metin
+        .replace(/```json|```/g, "")
+        .trim();
 
     return JSON.parse(temiz);
 
-  } catch (err) {
-    console.error(
-      "[JSON AYRISTIRMA HATASI]",
-      err.message
-    );
+  } catch {
 
     return null;
   }
 }
 
 /* ==========================================================================
-   AI OGRETMEN
+   AI ÖĞRETMEN
    ========================================================================== */
 
-router.post("/teacher", aiRateLimit, async (req, res) => {
+router.post(
+  "/teacher",
+  aiRateLimit,
+  async (req, res) => {
 
-  const { soru } = req.body;
-  const userId = req.header("X-User-Id");
+    const { soru } = req.body;
+    const userId =
+      req.header("X-User-Id");
 
-  if (!soru || !soru.trim()) {
-    return res.status(400).json({
-      hata: "Soru bos olamaz."
-    });
-  }
+    if (
+      !soru ||
+      !soru.trim()
+    ) {
 
-  try {
-
-    let kaynaklar = [];
-    let kaynakMetni = "";
-
-    if (guncelBilgiGerekiyorMu(soru)) {
-
-      kaynaklar = await searchWeb(
-        soru,
-        {
-          onlyTrusted: true,
-          limit: 5
-        }
-      );
-
-      if (kaynaklar.length > 0) {
-
-        kaynakMetni =
-          "\n\nAsagidaki guncel kaynaklari dikkate alarak cevap ver:\n" +
-          kaynaklar
-            .map(
-              (k, i) =>
-                `[${i + 1}] ${k.baslik} (${k.kaynak}) - ${k.icerikOzeti}`
-            )
-            .join("\n");
-      }
+      return res.status(400).json({
+        hata: "Soru boş olamaz."
+      });
     }
 
-    const cevapMetni =
-      await aiProvider.generate({
+    try {
 
-        system: SINAV_SISTEM_TALIMATI,
+      let kaynaklar = [];
+      let kaynakMetni = "";
 
-        prompt:
-          `Ogrenci sorusu: "${soru}"` +
-          kaynakMetni +
-          `
+      /*
+       * Güncel bilgi gerekiyorsa web araması yap.
+       */
 
-Kisa, anlasilir ve KPSS odakli cevap ver.
+      if (
+        guncelBilgiGerekiyorMu(soru)
+      ) {
 
-Uygunsa su basliklari kullan:
-- KPSS'de onemli
-- Karistirma
-- Ezberle
+        kaynaklar =
+          await searchWeb(
+            soru,
+            {
+              onlyTrusted: true,
+              limit: 5
+            }
+          );
+
+        if (
+          kaynaklar.length > 0
+        ) {
+
+          kaynakMetni =
+            "\n\nAşağıdaki güncel kaynakları dikkate alarak cevap ver:\n" +
+            kaynaklar
+              .map(
+                (k, i) =>
+                  `[${i + 1}] ${k.baslik} (${k.kaynak}) — ${k.icerikOzeti}`
+              )
+              .join("\n");
+        }
+      }
+
+      const cevapMetni =
+        await aiProvider.generate({
+
+          system:
+            SINAV_SISTEM_TALIMATI,
+
+          prompt:
+            `Öğrenci sorusu: "${soru}"` +
+            kaynakMetni +
+            `
+
+Kısa, anlaşılır ve KPSS odaklı cevap ver.
+
+Uygunsa şu başlıkları kullan:
+
+📌 KPSS'de önemli
+⚠ Karıştırma
+🧠 Ezberle
 `
+        });
+
+      aiUsageKaydet(
+        userId,
+        "teacher"
+      );
+
+      res.json({
+
+        cevap:
+          cevapMetni,
+
+        kaynaklar:
+          kaynaklar.map(k => ({
+            baslik: k.baslik,
+            url: k.url,
+            kaynak: k.kaynak,
+            tarih: k.tarih
+          })),
+
+        belirsiz:
+          kaynaklar.length === 0 &&
+          guncelBilgiGerekiyorMu(soru)
       });
 
-    aiUsageKaydet(
-      userId,
-      "teacher"
-    );
+    } catch (err) {
 
-    res.json({
-      cevap: cevapMetni,
+      console.error(
+        "[ai/teacher]",
+        err.message
+      );
 
-      kaynaklar:
-        kaynaklar.map(k => ({
-          baslik: k.baslik,
-          url: k.url,
-          kaynak: k.kaynak,
-          tarih: k.tarih
-        })),
+      res.status(503).json({
 
-      belirsiz:
-        kaynaklar.length === 0 &&
-        guncelBilgiGerekiyorMu(soru)
-    });
+        hata:
+          "Yapay zekâ servisine şu anda ulaşılamıyor. Lütfen tekrar deneyin."
 
-  } catch (err) {
-
-    console.error(
-      "[ai/teacher]",
-      err.message
-    );
-
-    res.status(503).json({
-      hata:
-        "Yapay zeka servisine su anda ulasilamiyor. Lutfen tekrar deneyin."
-    });
+      });
+    }
   }
-});
+);
 
 /* ==========================================================================
-   SORU URETME
+   AI SORU ÜRETME
    ========================================================================== */
 
 async function soruUret({
@@ -206,23 +240,19 @@ async function soruUret({
 }) {
 
   const prompt = `
-KPSS Ortaogretim seviyesinde,
+KPSS Ortaöğretim seviyesinde,
 "${subject}" dersinin "${topic}" konusunda,
 "${difficulty}" zorlukta,
-TAMAMEN OZGÜN ${count} adet coktan secmeli soru uret.
+TAMAMEN ÖZGÜN ${count} adet çoktan seçmeli soru üret.
 
 Kurallar:
 
-- Her sorunun tek bir dogru cevabi olmali.
-- 5 secenek olmali: A, B, C, D, E.
-- Celdiriciler mantikli ve konuyla ilgili olmali.
-- Telif hakki olan yayinlardan dogrudan kopya yapma.
-- Sorulari kendi cumlelerinle ozgun olarak yaz.
-- Bilgi hatasi yapma.
-- KPSS Ortaogretim seviyesine uygun ol.
-- Sorular birbirinin aynisi olmamali.
-
-SADECE ASAGIDAKI JSON FORMATINDA CEVAP VER:
+- Her sorunun tek bir doğru cevabı olmalı.
+- Çeldiriciler mantıklı ve konuyla ilgili olmalı.
+- Telif hakkı olan yayınlardan doğrudan kopya yapma.
+- Kendi cümlelerinle özgün soru yaz.
+- Yalnızca aşağıdaki JSON formatında cevap ver.
+- Başka hiçbir açıklama ekleme.
 
 [
   {
@@ -244,7 +274,7 @@ SADECE ASAGIDAKI JSON FORMATINDA CEVAP VER:
     await aiProvider.generate({
 
       system:
-        "Sen ozgun KPSS sorulari hazirlayan uzman bir soru yazarisisin. Yalnizca istenen JSON formatinda cevap ver.",
+        "Sen özgün KPSS soruları hazırlayan bir soru yazarısın. Yalnızca istenen JSON formatında cevap ver.",
 
       prompt,
 
@@ -260,12 +290,15 @@ SADECE ASAGIDAKI JSON FORMATINDA CEVAP VER:
 }
 
 /* ==========================================================================
-   SORU KALITE KONTROLU
+   SORU KALİTE KONTROLÜ
    ========================================================================== */
 
 function soruGecerliMi(s) {
 
-  if (!s || typeof s !== "object") {
+  if (
+    !s ||
+    typeof s !== "object"
+  ) {
     return false;
   }
 
@@ -285,11 +318,15 @@ function soruGecerliMi(s) {
   }
 
   const anahtarlar =
-    Object.keys(s.secenekler);
+    Object.keys(
+      s.secenekler
+    );
 
   if (
     !["A", "B", "C", "D", "E"]
-      .every(h => anahtarlar.includes(h))
+      .every(
+        h => anahtarlar.includes(h)
+      )
   ) {
     return false;
   }
@@ -303,7 +340,9 @@ function soruGecerliMi(s) {
   }
 
   const degerler =
-    Object.values(s.secenekler)
+    Object.values(
+      s.secenekler
+    )
       .map(v =>
         String(v)
           .trim()
@@ -321,7 +360,7 @@ function soruGecerliMi(s) {
 }
 
 /* ==========================================================================
-   KONU BAZLI SORU URET
+   KONU BAZLI SORU ÜRETME
    ========================================================================== */
 
 router.post(
@@ -339,9 +378,14 @@ router.post(
     const userId =
       req.header("X-User-Id");
 
-    if (!subject || !topic) {
+    if (
+      !subject ||
+      !topic
+    ) {
+
       return res.status(400).json({
-        hata: "Ders ve konu zorunludur."
+        hata:
+          "Ders ve konu zorunludur."
       });
     }
 
@@ -356,16 +400,31 @@ router.post(
 
     try {
 
+      /*
+       * AI ile soru üret.
+       */
+
       let sorular =
         await soruUret({
           subject,
           topic,
           difficulty,
-          count: guvenliSayi
+          count:
+            guvenliSayi
         });
 
+      /*
+       * Kalite kontrolü.
+       */
+
       let gecerliSorular =
-        sorular.filter(soruGecerliMi);
+        sorular.filter(
+          soruGecerliMi
+        );
+
+      /*
+       * Eksik varsa bir kez daha üret.
+       */
 
       if (
         gecerliSorular.length <
@@ -392,12 +451,20 @@ router.post(
           );
       }
 
+      /*
+       * Veritabanına kaydet.
+       */
+
       const kaydedilenler =
         gecerliSorular
-          .slice(0, guvenliSayi)
+          .slice(
+            0,
+            guvenliSayi
+          )
           .map(s => {
 
-            const id = nanoid();
+            const id =
+              nanoid();
 
             db.prepare(`
               INSERT INTO questions
@@ -415,23 +482,39 @@ router.post(
               )
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ai', NULL)
             `).run(
+
               id,
+
               subject,
+
               topic,
+
               s.soru,
+
               JSON.stringify(
                 s.secenekler
               ),
+
               s.dogruCevap,
+
               s.aciklama || "",
+
               difficulty
             );
 
             return {
+
               id,
-              soru: s.soru,
-              secenekler: s.secenekler,
-              dogruCevap: s.dogruCevap,
+
+              soru:
+                s.soru,
+
+              secenekler:
+                s.secenekler,
+
+              dogruCevap:
+                s.dogruCevap,
+
               aciklama:
                 s.aciklama || ""
             };
@@ -443,7 +526,8 @@ router.post(
       );
 
       res.json({
-        sorular: kaydedilenler
+        sorular:
+          kaydedilenler
       });
 
     } catch (err) {
@@ -454,15 +538,17 @@ router.post(
       );
 
       res.status(503).json({
+
         hata:
-          "Yapay zeka servisine su anda ulasilamiyor. Lutfen tekrar deneyin."
+          "Yapay zekâ servisine şu anda ulaşılamıyor. Lütfen tekrar deneyin."
+
       });
     }
   }
 );
 
 /* ==========================================================================
-   FOTOĞRAFTAN SORU COZ
+   FOTOĞRAFTAN SORU ÇÖZ
    ========================================================================== */
 
 router.post(
@@ -479,8 +565,10 @@ router.post(
       req.header("X-User-Id");
 
     if (!imageBase64) {
+
       return res.status(400).json({
-        hata: "Gorsel gonderilmedi."
+        hata:
+          "Görsel gönderilmedi."
       });
     }
 
@@ -490,12 +578,12 @@ router.post(
         await aiProvider.generateWithImage({
 
           system:
-            "Sen bir KPSS ogretmenisin. Sana bir soru fotografi verilecek.",
+            "Sen bir KPSS öğretmenisin. Sana bir soru fotoğrafı verilecek.",
 
           prompt: `
-Bu gorseldeki coktan secmeli soruyu ve siklarini oku ve coz.
+Bu görseldeki çoktan seçmeli soruyu ve şıklarını oku ve çöz.
 
-Yalnizca su JSON formatinda cevap ver:
+Yalnızca şu JSON formatında cevap ver:
 
 {
   "soru": "...",
@@ -510,34 +598,40 @@ Yalnizca su JSON formatinda cevap ver:
   "aciklama": "..."
 }
 
-Gorsel okunamiyorsa:
+Görsel okunamıyorsa veya soru net değilse:
 
 {
-  "hata": "Gorseldeki soru okunamiyor."
+  "hata": "Görseldeki soru okunamıyor."
 }
 `,
 
           imageBase64,
 
           mimeType:
-            mimeType || "image/jpeg"
+            mimeType ||
+            "image/jpeg"
         });
 
       const sonuc =
-        guvenliJsonAyristir(metin);
+        guvenliJsonAyristir(
+          metin
+        );
 
       if (!sonuc) {
 
         return res.status(422).json({
+
           hata:
-            "Gorseldeki soru anlasilamadi. Lutfen daha net bir fotograf deneyin."
+            "Görseldeki soru anlaşılamadı, lütfen daha net bir fotoğraf deneyin."
+
         });
       }
 
       if (sonuc.hata) {
 
         return res.status(422).json({
-          hata: sonuc.hata
+          hata:
+            sonuc.hata
         });
       }
 
@@ -556,8 +650,10 @@ Gorsel okunamiyorsa:
       );
 
       res.status(503).json({
+
         hata:
-          "Yapay zeka servisine su anda ulasilamiyor. Lutfen tekrar deneyin."
+          "Yapay zekâ servisine şu anda ulaşılamıyor. Lütfen tekrar deneyin."
+
       });
     }
   }
@@ -566,22 +662,26 @@ Gorsel okunamiyorsa:
 /* ==========================================================================
    KARMA TEST
    ==========================================================================
+   
+   ÖNEMLİ:
+   
+   BU BÖLÜM ARTIK AI KULLANMIYOR.
 
-   ESKI SISTEM:
-   80 soru -> uzun istekler -> timeout riski
+   Kullanıcı 80 soruluk test istediğinde:
 
-   YENI SISTEM:
-   80 soru
-   -> 10
-   -> 10
-   -> 10
-   -> 10
-   -> 10
-   -> 10
-   -> 10
-   -> 10
+   Frontend
+       ↓
+   Railway Backend
+       ↓
+   SQLite questions tablosu
+       ↓
+   Rastgele sorular
+       ↓
+   Frontend
 
-   Ayni anda maksimum 4 AI istegi calisir.
+   OpenRouter'a istek gönderilmez.
+   AI kotası kullanılmaz.
+   Timeout riski çok büyük ölçüde azalır.
    ========================================================================== */
 
 router.post(
@@ -589,10 +689,9 @@ router.post(
   aiRateLimit,
   async (req, res) => {
 
-    const { istekler } = req.body;
-
-    const userId =
-      req.header("X-User-Id");
+    const {
+      istekler
+    } = req.body;
 
     if (
       !Array.isArray(istekler) ||
@@ -600,8 +699,10 @@ router.post(
     ) {
 
       return res.status(400).json({
+
         hata:
           "istekler dizisi zorunludur."
+
       });
     }
 
@@ -609,13 +710,16 @@ router.post(
 
       const tumSorular = [];
 
-      /* ----------------------------------------------------------
-         GOREVLERI 10'AR SORULUK PARCALARA BOL
-         ---------------------------------------------------------- */
+      const kullanilanIdler =
+        new Set();
 
-      const gorevler = [];
+      /*
+       * İstenen ders/konu/soru sayılarını işle.
+       */
 
-      for (const istek of istekler) {
+      for (
+        const istek of istekler
+      ) {
 
         const {
           subject,
@@ -623,286 +727,454 @@ router.post(
           difficulty = "orta"
         } = istek;
 
-        if (!subject || !topic) {
+        if (
+          !subject ||
+          !topic
+        ) {
           continue;
         }
 
-        const toplamSayi =
+        const istenenSayi =
           Math.max(
             1,
             Math.min(
-              Number(istek.count) || 5,
-              20
+              Number(
+                istek.count
+              ) || 5,
+              80
             )
           );
 
-        for (
-          let kalan = toplamSayi;
-          kalan > 0;
-          kalan -= 10
+        let adaylar = [];
+
+        /* ==========================================================
+           1. AŞAMA
+           Ders + Konu + Zorluk
+           ========================================================== */
+
+        try {
+
+          adaylar =
+            db.prepare(`
+              SELECT
+                id,
+                subject,
+                topic,
+                question,
+                options,
+                correct_answer,
+                explanation,
+                difficulty
+              FROM questions
+              WHERE subject = ?
+                AND topic = ?
+                AND difficulty = ?
+              ORDER BY RANDOM()
+              LIMIT ?
+            `).all(
+
+              subject,
+              topic,
+              difficulty,
+              istenenSayi
+            );
+
+        } catch (err) {
+
+          console.error(
+            "[mixed-test] DB ilk sorgu hatası:",
+            err.message
+          );
+        }
+
+        /* ==========================================================
+           2. AŞAMA
+           Aynı ders + aynı konu
+           Zorluk fark etmez.
+           ========================================================== */
+
+        if (
+          adaylar.length <
+          istenenSayi
         ) {
 
-          gorevler.push({
+          const eksik =
+            istenenSayi -
+            adaylar.length;
+
+          const mevcutIdler =
+            adaylar.map(
+              s => s.id
+            );
+
+          let sorgu = `
+            SELECT
+              id,
+              subject,
+              topic,
+              question,
+              options,
+              correct_answer,
+              explanation,
+              difficulty
+            FROM questions
+            WHERE subject = ?
+              AND topic = ?
+          `;
+
+          const parametreler = [
             subject,
-            topic,
-            difficulty,
-            count:
-              Math.min(
-                kalan,
-                10
+            topic
+          ];
+
+          if (
+            mevcutIdler.length > 0
+          ) {
+
+            sorgu += `
+              AND id NOT IN (
+                ${mevcutIdler
+                  .map(() => "?")
+                  .join(",")}
               )
+            `;
+
+            parametreler.push(
+              ...mevcutIdler
+            );
+          }
+
+          sorgu += `
+            ORDER BY RANDOM()
+            LIMIT ?
+          `;
+
+          parametreler.push(
+            eksik
+          );
+
+          try {
+
+            const ekSorular =
+              db.prepare(
+                sorgu
+              ).all(
+                ...parametreler
+              );
+
+            adaylar =
+              adaylar.concat(
+                ekSorular
+              );
+
+          } catch (err) {
+
+            console.error(
+              "[mixed-test] DB ikinci sorgu hatası:",
+              err.message
+            );
+          }
+        }
+
+        /* ==========================================================
+           3. AŞAMA
+           Aynı dersten farklı konulardan tamamla.
+           ========================================================== */
+
+        if (
+          adaylar.length <
+          istenenSayi
+        ) {
+
+          const eksik =
+            istenenSayi -
+            adaylar.length;
+
+          const mevcutIdler =
+            adaylar.map(
+              s => s.id
+            );
+
+          let sorgu = `
+            SELECT
+              id,
+              subject,
+              topic,
+              question,
+              options,
+              correct_answer,
+              explanation,
+              difficulty
+            FROM questions
+            WHERE subject = ?
+          `;
+
+          const parametreler = [
+            subject
+          ];
+
+          if (
+            mevcutIdler.length > 0
+          ) {
+
+            sorgu += `
+              AND id NOT IN (
+                ${mevcutIdler
+                  .map(() => "?")
+                  .join(",")}
+              )
+            `;
+
+            parametreler.push(
+              ...mevcutIdler
+            );
+          }
+
+          sorgu += `
+            ORDER BY RANDOM()
+            LIMIT ?
+          `;
+
+          parametreler.push(
+            eksik
+          );
+
+          try {
+
+            const ekSorular =
+              db.prepare(
+                sorgu
+              ).all(
+                ...parametreler
+              );
+
+            adaylar =
+              adaylar.concat(
+                ekSorular
+              );
+
+          } catch (err) {
+
+            console.error(
+              "[mixed-test] DB üçüncü sorgu hatası:",
+              err.message
+            );
+          }
+        }
+
+        /* ==========================================================
+           SORULARI SONUCA EKLE
+           ========================================================== */
+
+        for (
+          const soru of adaylar
+        ) {
+
+          /*
+           * Aynı soru başka bir dersten/konudan
+           * gelmişse tekrar ekleme.
+           */
+
+          const soruId =
+            String(
+              soru.id
+            );
+
+          if (
+            kullanilanIdler.has(
+              soruId
+            )
+          ) {
+            continue;
+          }
+
+          kullanilanIdler.add(
+            soruId
+          );
+
+          /* ========================================================
+             OPTIONS JSON
+             ======================================================== */
+
+          let secenekler =
+            soru.options;
+
+          try {
+
+            if (
+              typeof secenekler ===
+              "string"
+            ) {
+
+              secenekler =
+                JSON.parse(
+                  secenekler
+                );
+            }
+
+          } catch (err) {
+
+            console.error(
+              "[mixed-test] Options JSON hatası:",
+              soru.id
+            );
+
+            continue;
+          }
+
+          /*
+           * Şıklar obje değilse soruyu atla.
+           */
+
+          if (
+            !secenekler ||
+            typeof secenekler !==
+              "object"
+          ) {
+
+            continue;
+          }
+
+          /* ========================================================
+             FRONTEND FORMATINA ÇEVİR
+             ======================================================== */
+
+          tumSorular.push({
+
+            id:
+              soru.id,
+
+            subject:
+              soru.subject,
+
+            topic:
+              soru.topic,
+
+            soru:
+              soru.question,
+
+            secenekler:
+              secenekler,
+
+            dogruCevap:
+              soru.correct_answer,
+
+            aciklama:
+              soru.explanation ||
+              "",
+
+            difficulty:
+              soru.difficulty
           });
         }
       }
 
-      console.log(
-        `[generate-mixed-test] ${gorevler.length} AI gorevi olusturuldu.`
-      );
-
-      /* ----------------------------------------------------------
-         AYNI ANDA MAKSIMUM 4 GOREV
-         ---------------------------------------------------------- */
-
-      const MAX_PARALLEL = 4;
-
-      for (
-        let baslangic = 0;
-        baslangic < gorevler.length;
-        baslangic += MAX_PARALLEL
-      ) {
-
-        const grup =
-          gorevler.slice(
-            baslangic,
-            baslangic +
-              MAX_PARALLEL
-          );
-
-        console.log(
-          `[generate-mixed-test] ${baslangic + 1}-${baslangic + grup.length} gorev calisiyor...`
-        );
-
-        const sonuclar =
-          await Promise.all(
-
-            grup.map(
-              async gorev => {
-
-                try {
-
-                  /* ----------------------------------------------
-                     ILK AI ISTEGI
-                     ---------------------------------------------- */
-
-                  let sorular =
-                    await soruUret({
-                      subject:
-                        gorev.subject,
-
-                      topic:
-                        gorev.topic,
-
-                      difficulty:
-                        gorev.difficulty,
-
-                      count:
-                        gorev.count
-                    });
-
-                  let gecerliSorular =
-                    sorular.filter(
-                      soruGecerliMi
-                    );
-
-                  /* ----------------------------------------------
-                     EKSIK SORULARI TAMAMLA
-                     ---------------------------------------------- */
-
-                  if (
-                    gecerliSorular.length <
-                    gorev.count
-                  ) {
-
-                    const eksik =
-                      gorev.count -
-                      gecerliSorular.length;
-
-                    console.log(
-                      `[generate-mixed-test] ${gorev.subject}/${gorev.topic}: ${eksik} eksik soru tekrar isteniyor.`
-                    );
-
-                    const ekSorular =
-                      await soruUret({
-                        subject:
-                          gorev.subject,
-
-                        topic:
-                          gorev.topic,
-
-                        difficulty:
-                          gorev.difficulty,
-
-                        count:
-                          eksik
-                      });
-
-                    gecerliSorular =
-                      gecerliSorular.concat(
-                        ekSorular.filter(
-                          soruGecerliMi
-                        )
-                      );
-                  }
-
-                  return {
-                    gorev,
-
-                    sorular:
-                      gecerliSorular.slice(
-                        0,
-                        gorev.count
-                      )
-                  };
-
-                } catch (err) {
-
-                  console.error(
-                    `[generate-mixed-test] ${gorev.subject}/${gorev.topic} hatasi:`,
-                    err.message
-                  );
-
-                  return {
-                    gorev,
-                    sorular: []
-                  };
-                }
-              }
-            )
-          );
-
-        /* ----------------------------------------------------------
-           SONUCLARI VERITABANINA KAYDET
-           ---------------------------------------------------------- */
-
-        for (
-          const sonuc of sonuclar
-        ) {
-
-          for (
-            const s of sonuc.sorular
-          ) {
-
-            try {
-
-              const id = nanoid();
-
-              db.prepare(`
-                INSERT INTO questions
-                (
-                  id,
-                  subject,
-                  topic,
-                  question,
-                  options,
-                  correct_answer,
-                  explanation,
-                  difficulty,
-                  source,
-                  created_by
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ai', NULL)
-              `).run(
-
-                id,
-
-                sonuc.gorev.subject,
-
-                sonuc.gorev.topic,
-
-                s.soru,
-
-                JSON.stringify(
-                  s.secenekler
-                ),
-
-                s.dogruCevap,
-
-                s.aciklama || "",
-
-                sonuc.gorev.difficulty
-              );
-
-              tumSorular.push({
-
-                id,
-
-                subject:
-                  sonuc.gorev.subject,
-
-                topic:
-                  sonuc.gorev.topic,
-
-                soru:
-                  s.soru,
-
-                secenekler:
-                  s.secenekler,
-
-                dogruCevap:
-                  s.dogruCevap,
-
-                aciklama:
-                  s.aciklama || ""
-              });
-
-            } catch (dbErr) {
-
-              console.error(
-                "[generate-mixed-test] DB kayit hatasi:",
-                dbErr.message
-              );
-            }
-          }
-        }
-
-        console.log(
-          `[generate-mixed-test] Su ana kadar ${tumSorular.length} soru hazir.`
-        );
-      }
-
-      /* ----------------------------------------------------------
-         HIC SORU GELMEDIYSE
-         ---------------------------------------------------------- */
+      /* ============================================================
+         HİÇ SORU YOKSA
+         ============================================================ */
 
       if (
         tumSorular.length === 0
       ) {
 
-        return res.status(503).json({
+        return res.status(404).json({
+
           hata:
-            "Sorular uretilemedi. Lutfen tekrar deneyin."
+            "Veritabanında henüz soru bulunamadı. Önce soru havuzunu oluşturmalısın."
+
         });
       }
 
-      /* ----------------------------------------------------------
-         KULLANIM KAYDI
-         ---------------------------------------------------------- */
+      /* ============================================================
+         TOPLAM İSTENEN SORU SAYISI
+         ============================================================ */
 
-      aiUsageKaydet(
-        userId,
-        "generate-mixed-test"
-      );
+      const toplamIstenen =
+        istekler.reduce(
+          (
+            toplam,
+            istek
+          ) => {
+
+            return (
+              toplam +
+              Math.max(
+                1,
+                Math.min(
+                  Number(
+                    istek.count
+                  ) || 5,
+                  80
+                )
+              )
+            );
+
+          },
+          0
+        );
+
+      /* ============================================================
+         SORULARI KARIŞTIR
+         ============================================================ */
+
+      for (
+        let i =
+          tumSorular.length - 1;
+        i > 0;
+        i--
+      ) {
+
+        const j =
+          Math.floor(
+            Math.random() *
+            (i + 1)
+          );
+
+        [
+          tumSorular[i],
+          tumSorular[j]
+        ] = [
+          tumSorular[j],
+          tumSorular[i]
+        ];
+      }
+
+      /* ============================================================
+         İSTENEN SAYI KADAR SORU GÖNDER
+         ============================================================ */
+
+      const sonuc =
+        tumSorular.slice(
+          0,
+          Math.min(
+            toplamIstenen,
+            tumSorular.length
+          )
+        );
 
       console.log(
-        `[generate-mixed-test] TAMAMLANDI: ${tumSorular.length} soru`
+        `[generate-mixed-test] DB'den ${sonuc.length} soru getirildi. AI kullanılmadı.`
       );
 
-      /* ----------------------------------------------------------
-         FRONTEND'E GONDER
-         ---------------------------------------------------------- */
+      /*
+       * DİKKAT:
+       *
+       * Burada aiUsageKaydet() YOK.
+       *
+       * Çünkü bu işlem OpenRouter kullanmıyor.
+       */
 
       res.json({
-        sorular: tumSorular
+
+        sorular:
+          sonuc,
+
+        toplam:
+          sonuc.length,
+
+        aiKullanildi:
+          false
+
       });
 
     } catch (err) {
@@ -912,9 +1184,11 @@ router.post(
         err.message
       );
 
-      res.status(503).json({
+      res.status(500).json({
+
         hata:
-          "Yapay zeka servisine su anda ulasilamiyor. Lutfen tekrar deneyin."
+          "Sorular veritabanından alınırken bir hata oluştu."
+
       });
     }
   }
